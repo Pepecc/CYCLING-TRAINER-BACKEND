@@ -2,6 +2,8 @@ import { WahooOAuthService } from '../../infrastructure/wahoo/WahooOAuthService'
 import { CyclistProfileRepository } from '../../domain/profile/CyclistProfileRepository'
 import { WahooWorkout } from '../../domain/wahoo/WahooWorkout'
 import { CyclistProfile } from '../../domain/profile/CyclistProfile'
+import { classifyPower, intensityFactor, workoutTss } from '../../domain/training/trainingMetrics'
+import { formatDate } from '../../domain/training/calendar'
 
 interface AnalyzeWorkoutInput {
   userId: string
@@ -21,7 +23,7 @@ export class AnalyzeWahooWorkout {
 
   async execute({ userId, workoutId }: AnalyzeWorkoutInput): Promise<AnalyzeWorkoutOutput> {
     const [workout, profile] = await Promise.all([
-      this.wahooService.getWorkoutWithSummary(userId, workoutId),
+      this.wahooService.getWorkout(userId, workoutId),
       this.profileRepository.findByUserId(userId),
     ])
 
@@ -31,7 +33,8 @@ export class AnalyzeWahooWorkout {
 
   private buildAnalysisContext(workout: WahooWorkout, profile: CyclistProfile | null): string {
     const s = workout.summary
-    const date = new Date(workout.startedAt).toLocaleDateString('es-ES', {
+    const ftp = profile?.ftp ?? null
+    const date = formatDate(new Date(workout.startedAt), {
       weekday: 'long', day: 'numeric', month: 'long',
     })
 
@@ -39,42 +42,36 @@ export class AnalyzeWahooWorkout {
       `ENTRENO A ANALIZAR (datos de Wahoo):`,
       `- Nombre: ${workout.name}`,
       `- Fecha: ${date}`,
-      `- Tipo: ${workout.workoutTypeLocationName}`,
+      `- Tipo: ${workout.workoutTypeName} (${workout.location})`,
       `- Duración: ${workout.durationMinutes} min`,
     ]
 
     if (s) {
+      if (s.durationActiveSeconds) lines.push(`- Tiempo en movimiento: ${Math.round(s.durationActiveSeconds / 60)} min`)
       if (s.distanceInMeters)  lines.push(`- Distancia: ${(s.distanceInMeters / 1000).toFixed(1)} km`)
+      if (s.ascentInMeters)    lines.push(`- Desnivel positivo: ${Math.round(s.ascentInMeters)} m`)
+      if (s.speedAvgKmh)       lines.push(`- Velocidad media: ${s.speedAvgKmh} km/h`)
       if (s.powerAvg)          lines.push(`- Potencia media: ${s.powerAvg}w`)
       if (s.normalizedPower)   lines.push(`- Potencia normalizada (NP): ${s.normalizedPower}w`)
-      if (s.powerMax)          lines.push(`- Potencia máxima: ${s.powerMax}w`)
       if (s.heartRateAvg)      lines.push(`- FC media: ${s.heartRateAvg} ppm`)
-      if (s.heartRateMax)      lines.push(`- FC máxima: ${s.heartRateMax} ppm`)
       if (s.cadenceAvg)        lines.push(`- Cadencia media: ${s.cadenceAvg} rpm`)
-      if (s.calories)          lines.push(`- Calorías: ${s.calories} kcal`)
-      if (s.tss)               lines.push(`- TSS: ${s.tss}`)
-      if (s.intensityFactor)   lines.push(`- IF: ${s.intensityFactor}`)
+      if (s.workKj)            lines.push(`- Trabajo: ${s.workKj} kJ`)
+      if (s.calories)          lines.push(`- Calorías: ${Math.round(s.calories)} kcal`)
+
+      const { tss, estimated } = workoutTss(workout, ftp)
+      if (tss) lines.push(`- TSS: ${tss}${estimated ? ' (estimado con NP y FTP)' : ''}`)
+
+      const iF = intensityFactor(s.normalizedPower, ftp)
+      if (iF) lines.push(`- IF: ${iF}`)
 
       // Classify NP in user's power zones if profile has FTP
-      if (s.normalizedPower && profile?.ftp && profile.powerZones) {
-        const zone = this.classifyPower(s.normalizedPower, profile.ftp)
-        if (zone) lines.push(`- Zona predominante (por NP): ${zone}`)
+      if (s.normalizedPower && ftp) {
+        lines.push(`- Zona predominante (por NP): ${classifyPower(s.normalizedPower, ftp)}`)
       }
     }
 
     lines.push(`\nAnaliza este entrenamiento en detalle. Ten en cuenta el perfil del ciclista y sus zonas de potencia. Comenta la distribución de intensidad, la carga (TSS), y da recomendaciones concretas para el próximo entrenamiento.`)
 
     return lines.join('\n')
-  }
-
-  private classifyPower(power: number, ftp: number): string | null {
-    const ratio = power / ftp
-    if (ratio < 0.55) return 'Z1 — Recuperación activa'
-    if (ratio < 0.75) return 'Z2 — Resistencia'
-    if (ratio < 0.90) return 'Z3 — Tempo'
-    if (ratio < 1.05) return 'Z4 — Umbral láctico'
-    if (ratio < 1.20) return 'Z5 — VO2max'
-    if (ratio < 1.50) return 'Z6 — Capacidad anaeróbica'
-    return 'Z7 — Potencia neuromuscular'
   }
 }

@@ -1,30 +1,23 @@
 import OpenAI from 'openai'
-import { AIPort } from '../../domain/chat/AIPort'
+import { AIPort, ToolExecutorFn } from '../../domain/chat/AIPort'
 import { APIMessage } from '../../domain/chat/Message'
 import { AgentTool, ToolResult } from '../../domain/chat/AgentTool'
-
-type ToolExecutorFn = (toolName: string, args: Record<string, unknown>) => Promise<string>
 
 export class OpenAIAdapter implements AIPort {
   private readonly client: OpenAI
   private readonly model: string
   private readonly maxTokens = 1024
-  private toolExecutor: ToolExecutorFn | null = null
 
   constructor() {
     this.client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
     this.model = process.env.OPENAI_MODEL ?? 'gpt-4.1'
   }
 
-  // Injected by SendMessage after construction to avoid circular deps
-  setToolExecutor(fn: ToolExecutorFn): void {
-    this.toolExecutor = fn
-  }
-
   async complete(
     systemPrompt: string,
     messages: APIMessage[],
-    tools?: AgentTool[]
+    tools?: AgentTool[],
+    executeTool?: ToolExecutorFn
   ): Promise<string> {
     const openaiMessages: OpenAI.Chat.ChatCompletionMessageParam[] = [
       { role: 'system', content: systemPrompt },
@@ -32,7 +25,7 @@ export class OpenAIAdapter implements AIPort {
     ]
 
     // No tools — simple completion
-    if (!tools || tools.length === 0 || !this.toolExecutor) {
+    if (!tools || tools.length === 0 || !executeTool) {
       const response = await this.client.chat.completions.create({
         model: this.model,
         max_tokens: this.maxTokens,
@@ -64,8 +57,13 @@ export class OpenAIAdapter implements AIPort {
       // Execute all tool calls in parallel
       const toolResults: ToolResult[] = await Promise.all(
         choice.message.tool_calls.map(async tc => {
-          const args = JSON.parse(tc.function.arguments) as Record<string, unknown>
-          const content = await this.toolExecutor!(tc.function.name, args)
+          let args: Record<string, unknown> = {}
+          try {
+            args = JSON.parse(tc.function.arguments || '{}') as Record<string, unknown>
+          } catch {
+            return { toolCallId: tc.id, content: JSON.stringify({ error: 'Argumentos de la tool no válidos' }) }
+          }
+          const content = await executeTool(tc.function.name, args)
           return { toolCallId: tc.id, content }
         })
       )

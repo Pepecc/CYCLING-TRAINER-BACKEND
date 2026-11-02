@@ -2,12 +2,17 @@ import { Router, Response } from 'express'
 import { authMiddleware, AuthRequest } from '../middleware/auth'
 import { GetProfile } from '../../../application/profile/GetProfile'
 import { UpdateProfile } from '../../../application/profile/UpdateProfile'
-import { Experience } from '../../../domain/profile/CyclistProfile'
+import { CyclistProfileFields, ProfileValidationError } from '../../../domain/profile/CyclistProfile'
 
 interface ProfileContainer {
   getProfile: GetProfile
   updateProfile: UpdateProfile
 }
+
+const EDITABLE_FIELDS: Array<keyof CyclistProfileFields> = [
+  'ftp', 'weightKg', 'hoursPerWeek', 'goal', 'experience',
+  'maxHr', 'restingHr', 'availableDays', 'targetEvents', 'limitations',
+]
 
 export function createProfileRouter({ getProfile, updateProfile }: ProfileContainer): Router {
   const router = Router()
@@ -26,17 +31,19 @@ export function createProfileRouter({ getProfile, updateProfile }: ProfileContai
   router.put('/', async (req, res: Response) => {
     try {
       const { userId } = req as AuthRequest
-      const { ftp, weightKg, hoursPerWeek, goal, experience } = req.body as {
-        ftp?: number
-        weightKg?: number
-        hoursPerWeek?: number
-        goal?: string
-        experience?: Experience
+      const body = (req.body ?? {}) as Record<string, unknown>
+
+      // Only whitelisted fields; the domain entity validates types and ranges
+      const patch: Record<string, unknown> = {}
+      for (const key of EDITABLE_FIELDS) {
+        if (key in body) patch[key] = body[key]
       }
-      const profile = await updateProfile.execute({ userId, ftp, weightKg, hoursPerWeek, goal, experience })
+
+      const profile = await updateProfile.execute({ userId, ...(patch as Partial<CyclistProfileFields>) })
       res.json({ profile })
     } catch (err) {
-      res.status(400).json({ error: (err as Error).message })
+      const status = err instanceof ProfileValidationError ? 400 : 500
+      res.status(status).json({ error: (err as Error).message })
     }
   })
 

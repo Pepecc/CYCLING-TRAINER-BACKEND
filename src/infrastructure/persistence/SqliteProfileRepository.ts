@@ -9,6 +9,11 @@ interface ProfileRow {
   hours_per_week: number | null
   goal: string | null
   experience: Experience
+  max_hr: number | null
+  resting_hr: number | null
+  available_days: string | null
+  target_events: string | null
+  limitations: string | null
   updated_at: string
 }
 
@@ -25,15 +30,22 @@ export class SqliteProfileRepository implements CyclistProfileRepository {
   async save(profile: CyclistProfile): Promise<void> {
     this.db.prepare(`
       INSERT INTO cyclist_profiles
-        (user_id, ftp, weight_kg, hours_per_week, goal, experience, updated_at)
+        (user_id, ftp, weight_kg, hours_per_week, goal, experience,
+         max_hr, resting_hr, available_days, target_events, limitations, updated_at)
       VALUES
-        (@userId, @ftp, @weightKg, @hoursPerWeek, @goal, @experience, @updatedAt)
+        (@userId, @ftp, @weightKg, @hoursPerWeek, @goal, @experience,
+         @maxHr, @restingHr, @availableDays, @targetEvents, @limitations, @updatedAt)
       ON CONFLICT(user_id) DO UPDATE SET
         ftp            = excluded.ftp,
         weight_kg      = excluded.weight_kg,
         hours_per_week = excluded.hours_per_week,
         goal           = excluded.goal,
         experience     = excluded.experience,
+        max_hr         = excluded.max_hr,
+        resting_hr     = excluded.resting_hr,
+        available_days = excluded.available_days,
+        target_events  = excluded.target_events,
+        limitations    = excluded.limitations,
         updated_at     = excluded.updated_at
     `).run({
       userId: profile.userId,
@@ -42,6 +54,11 @@ export class SqliteProfileRepository implements CyclistProfileRepository {
       hoursPerWeek: profile.hoursPerWeek,
       goal: profile.goal,
       experience: profile.experience,
+      maxHr: profile.maxHr,
+      restingHr: profile.restingHr,
+      availableDays: profile.availableDays,
+      targetEvents: profile.targetEvents,
+      limitations: profile.limitations,
       updatedAt: profile.updatedAt,
     })
   }
@@ -54,6 +71,11 @@ export class SqliteProfileRepository implements CyclistProfileRepository {
       hoursPerWeek: row.hours_per_week,
       goal: row.goal,
       experience: row.experience,
+      maxHr: row.max_hr,
+      restingHr: row.resting_hr,
+      availableDays: row.available_days,
+      targetEvents: row.target_events,
+      limitations: row.limitations,
       updatedAt: row.updated_at,
     })
   }

@@ -1,6 +1,7 @@
 import Database from 'better-sqlite3'
 import { WahooToken } from '../../domain/wahoo/WahooToken'
 import { WahooTokenRepository } from '../../domain/wahoo/WahooTokenRepository'
+import { encryptSecret, decryptSecret } from './tokenCipher'
 
 interface WahooTokenRow {
   user_id: string
@@ -30,8 +31,8 @@ export class SqliteWahooTokenRepository implements WahooTokenRepository {
         expires_at    = excluded.expires_at
     `).run({
       userId: token.userId,
-      accessToken: token.accessToken,
-      refreshToken: token.refreshToken,
+      accessToken: encryptSecret(token.accessToken),
+      refreshToken: encryptSecret(token.refreshToken),
       expiresAt: token.expiresAt,
       createdAt: token.createdAt,
     })
@@ -44,8 +45,8 @@ export class SqliteWahooTokenRepository implements WahooTokenRepository {
   private toEntity(row: WahooTokenRow): WahooToken {
     return new WahooToken({
       userId: row.user_id,
-      accessToken: row.access_token,
-      refreshToken: row.refresh_token,
+      accessToken: decryptSecret(row.access_token),
+      refreshToken: decryptSecret(row.refresh_token),
       expiresAt: row.expires_at,
       createdAt: row.created_at,
     })

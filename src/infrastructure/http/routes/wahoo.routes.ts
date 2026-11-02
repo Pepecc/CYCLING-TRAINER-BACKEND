@@ -1,25 +1,50 @@
 import { Router, Request, Response } from 'express'
 import crypto from 'crypto'
 import { authMiddleware, AuthRequest } from '../middleware/auth'
-import { WahooOAuthService } from '../../wahoo/WahooOAuthService'
+import { rateLimit } from '../middleware/rateLimit'
+import { WahooOAuthService, WahooNotConnectedError } from '../../wahoo/WahooOAuthService'
+import { OAuthStateRepository } from '../../../domain/wahoo/OAuthStateRepository'
 import { GetWahooWorkouts } from '../../../application/wahoo/GetWahooWorkouts'
 import { AnalyzeWahooWorkout } from '../../../application/wahoo/AnalyzeWahooWorkout'
+import { SyncWahooWorkouts } from '../../../application/wahoo/SyncWahooWorkouts'
+import { DisconnectWahoo } from '../../../application/wahoo/DisconnectWahoo'
 import { SendMessage } from '../../../application/chat/SendMessage'
 
 interface WahooContainer {
   wahooService: WahooOAuthService
+  oauthStates: OAuthStateRepository
+  syncWorkouts: SyncWahooWorkouts
   getWahooWorkouts: GetWahooWorkouts
   analyzeWahooWorkout: AnalyzeWahooWorkout
+  disconnectWahoo: DisconnectWahoo
   sendMessage: SendMessage
 }
 
-// Temporal in-memory store for OAuth state — good enough for single-instance
-// In multi-instance deploy, use Redis or DB
-const pendingStates = new Map<string, string>()  // state → userId
+const OAUTH_STATE_TTL_MS = 10 * 60 * 1000
+
+function errorStatus(err: unknown): number {
+  return err instanceof WahooNotConnectedError ? 403 : 500
+}
 
 export function createWahooRouter(container: WahooContainer): Router {
   const router = Router()
-  const { wahooService, getWahooWorkouts, analyzeWahooWorkout, sendMessage } = container
+  const {
+    wahooService, oauthStates, syncWorkouts, getWahooWorkouts,
+    analyzeWahooWorkout, disconnectWahoo, sendMessage,
+  } = container
+
+  // Analysis triggers an AI call, so it gets the same per-user limit as the chat
+  const analyzeLimiter = rateLimit({
+    windowMs: 60 * 1000,
+    max: Number(process.env.CHAT_RATE_LIMIT_PER_MINUTE) || 10,
+  })
+
+  // CSRF protection: random state tied to this userId, stored in DB (single use, 10 min)
+  async function createState(userId: string): Promise<string> {
+    const state = crypto.randomBytes(16).toString('hex')
+    await oauthStates.create(state, userId, OAUTH_STATE_TTL_MS)
+    return state
+  }
 
   // ── GET /api/wahoo/status ─────────────────────────────────────────────────
   // Check if current user has Wahoo connected
@@ -31,36 +56,25 @@ export function createWahooRouter(container: WahooContainer): Router {
 
   // ── GET /api/wahoo/connect ────────────────────────────────────────────────
   // Redirects user to Wahoo authorization page
-  router.get('/connect', authMiddleware, (req, res: Response) => {
+  router.get('/connect', authMiddleware, async (req, res: Response) => {
     const { userId } = req as AuthRequest
-
-    // CSRF protection: generate a random state tied to this userId
-    const state = crypto.randomBytes(16).toString('hex')
-    pendingStates.set(state, userId)
-
-    // Clean up old states after 10 minutes
-    setTimeout(() => pendingStates.delete(state), 10 * 60 * 1000)
-
-    const authUrl = wahooService.buildAuthorizationUrl(state)
-    res.redirect(authUrl)
+    const state = await createState(userId)
+    res.redirect(wahooService.buildAuthorizationUrl(state))
   })
 
   // ── GET /api/wahoo/connect-url ────────────────────────────────────────────
   // Returns the Wahoo authorization URL as JSON (for frontend-initiated OAuth)
-  router.get('/connect-url', authMiddleware, (req, res: Response) => {
+  router.get('/connect-url', authMiddleware, async (req, res: Response) => {
     const { userId } = req as AuthRequest
-    const state = crypto.randomBytes(16).toString('hex')
-    pendingStates.set(state, userId)
-    setTimeout(() => pendingStates.delete(state), 10 * 60 * 1000)
-    const url = wahooService.buildAuthorizationUrl(state)
-    res.json({ url })
+    const state = await createState(userId)
+    res.json({ url: wahooService.buildAuthorizationUrl(state) })
   })
 
   // ── GET /api/wahoo/callback ───────────────────────────────────────────────
   // Wahoo redirects here after user authorizes
   router.get('/callback', async (req: Request, res: Response) => {
     const { code, state, error } = req.query as Record<string, string>
-    const frontendUrl = (process.env.FRONTEND_URL)?.toString().replace(/\/$/, '')
+    const frontendUrl = (process.env.FRONTEND_URL ?? '').split(',')[0].trim().replace(/\/$/, '')
 
     if (error) {
       return res.redirect(`${frontendUrl}/?wahoo_error=${encodeURIComponent(error)}`)
@@ -70,19 +84,22 @@ export function createWahooRouter(container: WahooContainer): Router {
       return res.status(400).send('Parámetros de callback inválidos')
     }
 
-    const userId = pendingStates.get(state)
+    const userId = await oauthStates.consume(state)
     if (!userId) {
-      return res.status(400).send('State inválido o expirado. Vuelve a intentar la conexión.')
+      return res.redirect(`${frontendUrl}/?wahoo_error=${encodeURIComponent('La conexión ha caducado. Vuelve a intentarlo.')}`)
     }
-
-    pendingStates.delete(state)
 
     try {
       await wahooService.exchangeCode(userId, code)
+
+      // Import the workout history in the background so the first chat is fast
+      syncWorkouts.execute(userId, { force: true })
+        .catch(err => console.error('Initial Wahoo sync failed:', err))
+
       res.redirect(`${frontendUrl}/?wahoo_connected=true`)
     } catch (err) {
       console.error('Wahoo callback error:', err)
-      res.redirect(`${frontendUrl}/?wahoo_error=${encodeURIComponent((err as Error).message)}`)
+      res.redirect(`${frontendUrl}/?wahoo_error=${encodeURIComponent('No se pudo completar la conexión con Wahoo')}`)
     }
   })
 
@@ -97,16 +114,14 @@ export function createWahooRouter(container: WahooContainer): Router {
       const workouts = await getWahooWorkouts.execute(userId, page, perPage)
       res.json({ workouts })
     } catch (err) {
-      const message = (err as Error).message
-      const status = message.includes('no conectado') ? 403 : 500
-      res.status(status).json({ error: message })
+      res.status(errorStatus(err)).json({ error: (err as Error).message })
     }
   })
 
   // ── POST /api/wahoo/workouts/:id/analyze ─────────────────────────────────
   // Fetch workout from Wahoo + send to coach for analysis
   // Creates a new conversation with the workout context pre-loaded
-  router.post('/workouts/:id/analyze', authMiddleware, async (req, res: Response) => {
+  router.post('/workouts/:id/analyze', authMiddleware, analyzeLimiter, async (req, res: Response) => {
     const { userId } = req as AuthRequest
     const workoutId = Number(req.params.id)
 
@@ -129,17 +144,16 @@ export function createWahooRouter(container: WahooContainer): Router {
         message: result.message,
       })
     } catch (err) {
-      const message = (err as Error).message
-      const status = message.includes('no conectado') ? 403 : 500
-      res.status(status).json({ error: message })
+      res.status(errorStatus(err)).json({ error: (err as Error).message })
     }
   })
 
   // ── DELETE /api/wahoo/disconnect ─────────────────────────────────────────
+  // Revokes the app's permissions in Wahoo and deletes tokens and synced workouts
   router.delete('/disconnect', authMiddleware, async (req, res: Response) => {
     const { userId } = req as AuthRequest
     try {
-      await wahooService.disconnect(userId)
+      await disconnectWahoo.execute(userId)
       res.json({ disconnected: true })
     } catch (err) {
       res.status(500).json({ error: (err as Error).message })

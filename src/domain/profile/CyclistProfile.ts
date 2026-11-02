@@ -1,5 +1,7 @@
 export type Experience = 'beginner' | 'intermediate' | 'advanced'
 
+export const EXPERIENCES: Experience[] = ['beginner', 'intermediate', 'advanced']
+
 export interface PowerZone {
   name: string
   min: number
@@ -16,23 +18,50 @@ export interface PowerZones {
   z7: PowerZone
 }
 
-export interface CyclistProfileProps {
-  userId: string
+// Campos editables del perfil (por el usuario en el formulario o por el coach con la tool update_profile)
+export interface CyclistProfileFields {
   ftp: number | null
   weightKg: number | null
   hoursPerWeek: number | null
   goal: string | null
   experience: Experience
+  maxHr: number | null            // FC máxima (ppm)
+  restingHr: number | null        // FC en reposo (ppm)
+  availableDays: string | null    // p.ej. "martes, jueves, sábado y domingo"
+  targetEvents: string | null     // eventos y fechas objetivo de la temporada
+  limitations: string | null      // lesiones, molestias, limitaciones físicas
+}
+
+export interface CyclistProfileProps extends CyclistProfileFields {
+  userId: string
   updatedAt: string
 }
 
-export class CyclistProfile {
+export class ProfileValidationError extends Error {}
+
+const TEXT_MAX = 500
+
+// Rangos razonables para un ciclista amateur; null siempre está permitido (borra el dato)
+const NUMERIC_RANGES: Record<'ftp' | 'weightKg' | 'hoursPerWeek' | 'maxHr' | 'restingHr', [number, number, string]> = {
+  ftp:          [50, 600, 'El FTP debe estar entre 50 y 600 W'],
+  weightKg:     [30, 200, 'El peso debe estar entre 30 y 200 kg'],
+  hoursPerWeek: [0.5, 40, 'Las horas semanales deben estar entre 0,5 y 40'],
+  maxHr:        [100, 230, 'La FC máxima debe estar entre 100 y 230 ppm'],
+  restingHr:    [25, 120, 'La FC en reposo debe estar entre 25 y 120 ppm'],
+}
+
+export class CyclistProfile implements CyclistProfileProps {
   readonly userId: string
   ftp: number | null
   weightKg: number | null
   hoursPerWeek: number | null
   goal: string | null
   experience: Experience
+  maxHr: number | null
+  restingHr: number | null
+  availableDays: string | null
+  targetEvents: string | null
+  limitations: string | null
   updatedAt: string
 
   constructor(props: CyclistProfileProps) {
@@ -42,26 +71,81 @@ export class CyclistProfile {
     this.hoursPerWeek = props.hoursPerWeek
     this.goal = props.goal
     this.experience = props.experience
+    this.maxHr = props.maxHr
+    this.restingHr = props.restingHr
+    this.availableDays = props.availableDays
+    this.targetEvents = props.targetEvents
+    this.limitations = props.limitations
     this.updatedAt = props.updatedAt
   }
 
-  static create(params: {
-    userId: string
-    ftp?: number | null
-    weightKg?: number | null
-    hoursPerWeek?: number | null
-    goal?: string | null
-    experience?: Experience
-  }): CyclistProfile {
+  static create(userId: string): CyclistProfile {
     return new CyclistProfile({
-      userId: params.userId,
-      ftp: params.ftp ?? null,
-      weightKg: params.weightKg ?? null,
-      hoursPerWeek: params.hoursPerWeek ?? null,
-      goal: params.goal ?? null,
-      experience: params.experience ?? 'intermediate',
+      userId,
+      ftp: null,
+      weightKg: null,
+      hoursPerWeek: null,
+      goal: null,
+      experience: 'intermediate',
+      maxHr: null,
+      restingHr: null,
+      availableDays: null,
+      targetEvents: null,
+      limitations: null,
       updatedAt: new Date().toISOString(),
     })
+  }
+
+  // Applies a partial update; undefined = keep, null = clear. Throws ProfileValidationError.
+  update(patch: Partial<CyclistProfileFields>): void {
+    const next: CyclistProfileFields = { ...this.fields(), ...stripUndefined(patch) }
+
+    for (const [key, [min, max, msg]] of Object.entries(NUMERIC_RANGES)) {
+      const v = next[key as keyof typeof NUMERIC_RANGES]
+      if (v === null) continue
+      if (typeof v !== 'number' || !Number.isFinite(v) || v < min || v > max) {
+        throw new ProfileValidationError(msg)
+      }
+    }
+
+    if (!EXPERIENCES.includes(next.experience)) {
+      throw new ProfileValidationError('Nivel no válido (beginner, intermediate o advanced)')
+    }
+
+    if (next.maxHr !== null && next.restingHr !== null && next.restingHr >= next.maxHr) {
+      throw new ProfileValidationError('La FC en reposo debe ser menor que la FC máxima')
+    }
+
+    for (const key of ['goal', 'availableDays', 'targetEvents', 'limitations'] as const) {
+      const v = next[key]
+      if (v === null) continue
+      if (typeof v !== 'string') throw new ProfileValidationError(`Valor no válido en ${key}`)
+      const trimmed = v.trim()
+      if (trimmed.length > TEXT_MAX) throw new ProfileValidationError(`Texto demasiado largo (máx. ${TEXT_MAX} caracteres)`)
+      next[key] = trimmed || null
+    }
+
+    if (next.ftp !== null) next.ftp = Math.round(next.ftp)
+    if (next.maxHr !== null) next.maxHr = Math.round(next.maxHr)
+    if (next.restingHr !== null) next.restingHr = Math.round(next.restingHr)
+
+    Object.assign(this, next)
+    this.updatedAt = new Date().toISOString()
+  }
+
+  fields(): CyclistProfileFields {
+    return {
+      ftp: this.ftp,
+      weightKg: this.weightKg,
+      hoursPerWeek: this.hoursPerWeek,
+      goal: this.goal,
+      experience: this.experience,
+      maxHr: this.maxHr,
+      restingHr: this.restingHr,
+      availableDays: this.availableDays,
+      targetEvents: this.targetEvents,
+      limitations: this.limitations,
+    }
   }
 
   get wattsPerKg(): number | null {
@@ -87,4 +171,8 @@ export class CyclistProfile {
   isComplete(): boolean {
     return !!(this.ftp && this.weightKg && this.hoursPerWeek && this.goal)
   }
+}
+
+function stripUndefined<T extends object>(obj: T): Partial<T> {
+  return Object.fromEntries(Object.entries(obj).filter(([, v]) => v !== undefined)) as Partial<T>
 }
