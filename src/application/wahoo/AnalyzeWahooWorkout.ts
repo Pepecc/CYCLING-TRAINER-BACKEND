@@ -2,8 +2,14 @@ import { WahooOAuthService } from '../../infrastructure/wahoo/WahooOAuthService'
 import { CyclistProfileRepository } from '../../domain/profile/CyclistProfileRepository'
 import { WahooWorkout } from '../../domain/wahoo/WahooWorkout'
 import { CyclistProfile } from '../../domain/profile/CyclistProfile'
-import { classifyPower, intensityFactor, workoutTss } from '../../domain/training/trainingMetrics'
+import { classifyPower, classifyHeartRate, intensityFactor, workoutTss, TssSource } from '../../domain/training/trainingMetrics'
 import { formatDate } from '../../domain/training/calendar'
+
+const TSS_SOURCE_NOTES: Record<TssSource, string> = {
+  power: '',
+  power_estimated: ' (estimado con NP y FTP)',
+  hr: ' (hrTSS estimado con la FC media)',
+}
 
 interface AnalyzeWorkoutInput {
   userId: string
@@ -58,8 +64,8 @@ export class AnalyzeWahooWorkout {
       if (s.workKj)            lines.push(`- Trabajo: ${s.workKj} kJ`)
       if (s.calories)          lines.push(`- Calorías: ${Math.round(s.calories)} kcal`)
 
-      const { tss, estimated } = workoutTss(workout, ftp)
-      if (tss) lines.push(`- TSS: ${tss}${estimated ? ' (estimado con NP y FTP)' : ''}`)
+      const { tss, source } = workoutTss(workout, profile)
+      if (tss && source) lines.push(`- TSS: ${tss}${TSS_SOURCE_NOTES[source]}`)
 
       const iF = intensityFactor(s.normalizedPower, ftp)
       if (iF) lines.push(`- IF: ${iF}`)
@@ -68,9 +74,13 @@ export class AnalyzeWahooWorkout {
       if (s.normalizedPower && ftp) {
         lines.push(`- Zona predominante (por NP): ${classifyPower(s.normalizedPower, ftp)}`)
       }
+      if (s.heartRateAvg && profile?.maxHr && profile.restingHr) {
+        const hrZone = classifyHeartRate(s.heartRateAvg, profile.maxHr, profile.restingHr)
+        if (hrZone) lines.push(`- Zona de la FC media: ${hrZone}`)
+      }
     }
 
-    lines.push(`\nAnaliza este entrenamiento en detalle. Ten en cuenta el perfil del ciclista y sus zonas de potencia. Comenta la distribución de intensidad, la carga (TSS), y da recomendaciones concretas para el próximo entrenamiento.`)
+    lines.push(`\nAnaliza este entrenamiento en detalle. Ten en cuenta el perfil del ciclista y sus zonas de potencia o de FC. Comenta la distribución de intensidad, la carga (TSS), y da recomendaciones concretas para el próximo entrenamiento.`)
 
     return lines.join('\n')
   }

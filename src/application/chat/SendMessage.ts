@@ -49,7 +49,7 @@ export class SendMessage {
     // Load or create conversation
     let conversation: Conversation
     if (conversationId) {
-      const found = await this.conversationRepository.findById(conversationId)
+      const found = await this.conversationRepository.findById(userId, conversationId)
       if (!found || found.userId !== userId) throw new Error('Conversación no encontrada')
       conversation = found
     } else {
@@ -66,7 +66,7 @@ export class SendMessage {
       role: 'user',
       content: content.trim(),
     })
-    await this.conversationRepository.saveMessage(userMessage)
+    await this.conversationRepository.saveMessage(userId, userMessage)
     conversation.addMessage(userMessage)
 
     // Bind the tool executor to this request's userId (never shared between requests)
@@ -86,7 +86,7 @@ export class SendMessage {
       role: 'assistant',
       content: assistantContent,
     })
-    await this.conversationRepository.saveMessage(assistantMessage)
+    await this.conversationRepository.saveMessage(userId, assistantMessage)
 
     return { conversationId: conversation.id, message: assistantMessage }
   }
@@ -136,6 +136,15 @@ export class SendMessage {
       sections.push(
         `ZONAS DE POTENCIA (basadas en FTP ${p.ftp}w):\n${zonesText}\n\n` +
         'Si el ciclista menciona vatios concretos de un entreno, clasifícalos en su zona correspondiente.'
+      )
+    }
+
+    const hrZones = p.heartRateZones
+    if (hrZones) {
+      sections.push(
+        `ZONAS DE FC (Karvonen, FC máx ${p.maxHr} y reposo ${p.restingHr} ppm):\n` +
+        hrZones.map(z => `  ${z.zone} ${z.name}: ${z.min}-${z.max} ppm`).join('\n') +
+        '\n\nEn rodillo o bici estática sin potenciómetro, prescribe la intensidad con estas zonas de FC.'
       )
     }
 

@@ -1,6 +1,7 @@
 import { Request, Response, NextFunction } from 'express'
 import admin from 'firebase-admin'
 import { UserRepository } from '../../../domain/user/UserRepository'
+import { getFirebaseApp } from '../../firebase/firebaseAdmin'
 
 export interface AuthRequest extends Request {
   userId: string
@@ -9,26 +10,9 @@ export interface AuthRequest extends Request {
 
 let _userRepository: UserRepository
 
-function loadServiceAccount(): admin.ServiceAccount {
-  const raw = process.env.FIREBASE_SERVICE_ACCOUNT
-  if (!raw) {
-    throw new Error('Falta FIREBASE_SERVICE_ACCOUNT: pega el JSON de la cuenta de servicio de Firebase en una sola línea')
-  }
-  try {
-    return JSON.parse(raw) as admin.ServiceAccount
-  } catch {
-    throw new Error('FIREBASE_SERVICE_ACCOUNT no es un JSON válido')
-  }
-}
-
 export function configureAuth(userRepository: UserRepository): void {
   _userRepository = userRepository
-
-  if (!admin.apps.length) {
-    admin.initializeApp({
-      credential: admin.credential.cert(loadServiceAccount()),
-    })
-  }
+  getFirebaseApp()
 }
 
 export async function authMiddleware(req: Request, res: Response, next: NextFunction): Promise<void> {

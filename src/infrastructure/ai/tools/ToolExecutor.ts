@@ -5,7 +5,7 @@ import { WahooWorkout } from '../../../domain/wahoo/WahooWorkout'
 import { WorkoutRepository } from '../../../domain/wahoo/WorkoutRepository'
 import { SyncWahooWorkouts } from '../../../application/wahoo/SyncWahooWorkouts'
 import { UpdateProfile } from '../../../application/profile/UpdateProfile'
-import { classifyPower, intensityFactor, workoutTss } from '../../../domain/training/trainingMetrics'
+import { classifyPower, classifyHeartRate, intensityFactor, workoutTss, TssSource } from '../../../domain/training/trainingMetrics'
 import { dayKey, addDays, mondayKey, formatDayKey, formatDate } from '../../../domain/training/calendar'
 
 interface WeekBucket {
@@ -30,6 +30,12 @@ interface SeasonKpis {
 
 // CTL/ATL need history before the period being reported, otherwise they start at 0
 const CTL_WARMUP_DAYS = 90
+
+const TSS_SOURCE_LABELS: Record<TssSource, string> = {
+  power: 'potencia (Wahoo)',
+  power_estimated: 'estimado con NP y FTP',
+  hr: 'hrTSS (FC media)',
+}
 
 // update_profile argument (snake_case, as the model sees it) → profile field
 const PROFILE_ARG_MAP: Record<string, keyof CyclistProfileFields> = {
@@ -135,10 +141,11 @@ export class ToolExecutor {
         if (s.workKj)           entry.trabajo_kj = s.workKj
         if (s.calories)         entry.calorias = Math.round(s.calories)
 
-        const { tss, estimated } = workoutTss(w, ftp)
-        if (tss) {
-          entry.tss = tss
-          if (estimated) entry.tss_estimado = true
+        const load = workoutTss(w, profile)
+        if (load.tss && load.source) {
+          entry.tss = load.tss
+          entry.tss_origen = TSS_SOURCE_LABELS[load.source]
+          if (load.estimated) entry.tss_estimado = true
         }
 
         const iF = intensityFactor(s.normalizedPower, ftp)
@@ -146,6 +153,10 @@ export class ToolExecutor {
 
         if (s.normalizedPower && ftp) {
           entry.zona_predominante = classifyPower(s.normalizedPower, ftp)
+        }
+        if (s.heartRateAvg && profile?.maxHr && profile.restingHr) {
+          const hrZone = classifyHeartRate(s.heartRateAvg, profile.maxHr, profile.restingHr)
+          if (hrZone) entry.zona_fc_media = hrZone
         }
       }
 
@@ -178,13 +189,15 @@ export class ToolExecutor {
     })
 
     let estimatedCount = 0
+    let hrTssCount = 0
 
     const summary: WeekBucket[] = Array.from(buckets.entries())
       .sort(([a], [b]) => a.localeCompare(b))
       .map(([monday, ws]) => {
         const tss = ws.reduce((acc, w) => {
-          const t = workoutTss(w, ftp)
+          const t = workoutTss(w, profile)
           if (t.estimated) estimatedCount++
+          if (t.source === 'hr') hrTssCount++
           return acc + (t.tss ?? 0)
         }, 0)
         const hours = ws.reduce((acc, w) => acc + w.durationMinutes / 60, 0)
@@ -213,6 +226,7 @@ export class ToolExecutor {
         horas_totales: +totalHours.toFixed(1),
         tss_medio_semanal: avgTssPerWeek,
         entrenos_con_tss_estimado: estimatedCount,
+        entrenos_con_hrtss: hrTssCount,
       },
     })
   }
@@ -239,17 +253,19 @@ export class ToolExecutor {
     const dailyTss = new Map<string, number>()
     let workoutsWithoutTss = 0
     let workoutsWithEstimatedTss = 0
+    let workoutsWithHrTss = 0
     const seasonWorkouts: WahooWorkout[] = []
 
     workouts.forEach(w => {
       const key = dayKey(new Date(w.startedAt))
       if (key < warmupStartKey) return
-      const { tss, estimated } = workoutTss(w, ftp)
+      const { tss, estimated, source } = workoutTss(w, profile)
       dailyTss.set(key, (dailyTss.get(key) ?? 0) + (tss ?? 0))
       if (key >= seasonStartKey) {
         seasonWorkouts.push(w)
         if (tss === null) workoutsWithoutTss++
         if (estimated) workoutsWithEstimatedTss++
+        if (source === 'hr') workoutsWithHrTss++
       }
     })
 
@@ -295,8 +311,9 @@ export class ToolExecutor {
       calidad_datos: {
         entrenos_sin_tss: workoutsWithoutTss,
         entrenos_con_tss_estimado: workoutsWithEstimatedTss,
+        entrenos_con_hrtss: workoutsWithHrTss,
         nota: workoutsWithoutTss > 0
-          ? 'Algunos entrenos no tienen TSS (sin potenciómetro o sin FTP en el perfil); CTL/ATL pueden estar infravalorados.'
+          ? 'Algunos entrenos no tienen carga: sin potencia ni FTP, y sin FC media o sin FC máxima y en reposo en el perfil. CTL/ATL pueden estar infravalorados.'
           : undefined,
       },
     })

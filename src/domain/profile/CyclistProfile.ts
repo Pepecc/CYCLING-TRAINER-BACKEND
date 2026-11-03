@@ -1,3 +1,5 @@
+import { HR_ZONES } from '../training/trainingMetrics'
+
 export type Experience = 'beginner' | 'intermediate' | 'advanced'
 
 export const EXPERIENCES: Experience[] = ['beginner', 'intermediate', 'advanced']
@@ -6,6 +8,13 @@ export interface PowerZone {
   name: string
   min: number
   max: number | null
+}
+
+export interface HeartRateZone {
+  zone: string
+  name: string
+  min: number   // ppm
+  max: number   // ppm
 }
 
 export interface PowerZones {
@@ -166,6 +175,20 @@ export class CyclistProfile implements CyclistProfileProps {
       z6: { name: 'Capacidad anaeróbica',   min: Math.round(f * 1.21),   max: Math.round(f * 1.50) },
       z7: { name: 'Potencia neuromuscular', min: Math.round(f * 1.51),   max: null },
     }
+  }
+
+  // Karvonen 5-zone model on heart rate reserve (needs max and resting HR)
+  get heartRateZones(): HeartRateZone[] | null {
+    if (!this.maxHr || !this.restingHr || this.restingHr >= this.maxHr) return null
+    const rest = this.restingHr
+    const reserve = this.maxHr - rest
+    const bpm = (fraction: number) => Math.round(rest + fraction * reserve)
+    return HR_ZONES.map((z, i) => ({
+      zone: z.zone,
+      name: z.name,
+      min: i === 0 ? bpm(z.min) : bpm(z.min) + 1,
+      max: bpm(z.max),
+    }))
   }
 
   isComplete(): boolean {
