@@ -1,5 +1,6 @@
 import { Router, Response } from 'express'
 import { authMiddleware, AuthRequest } from '../middleware/auth'
+import { rateLimit } from '../middleware/rateLimit'
 import { SendMessage } from '../../../application/chat/SendMessage'
 import { GetConversations } from '../../../application/chat/GetConversations'
 import { GetConversation } from '../../../application/chat/GetConversation'
@@ -34,7 +35,12 @@ export function createChatRouter({ sendMessage, getConversations, getConversatio
     }
   })
 
-  router.post('/message', async (req, res: Response) => {
+  const messageLimiter = rateLimit({
+    windowMs: 60 * 1000,
+    max: Number(process.env.CHAT_RATE_LIMIT_PER_MINUTE) || 10,
+  })
+
+  router.post('/message', messageLimiter, async (req, res: Response) => {
     try {
       const { userId } = req as AuthRequest
       const { content, conversationId } = req.body as { content: string; conversationId?: string }

@@ -1,10 +1,16 @@
 import { WahooToken } from '../../domain/wahoo/WahooToken'
 import { WahooWorkout } from '../../domain/wahoo/WahooWorkout'
 import { WahooTokenRepository } from '../../domain/wahoo/WahooTokenRepository'
+import { describeWorkoutType } from '../../domain/wahoo/WorkoutTypes'
 
 const WAHOO_BASE_URL = 'https://api.wahooligan.com'
+const DEFAULT_SCOPES = 'email power_zones_read workouts_read plans_read routes_read offline_data user_read'
+const MAX_PER_PAGE = 50
+const MAX_PAGES = 20  // tope de seguridad: 1000 entrenos por consulta
 
-// Raw shapes returned by Wahoo API
+// Raw shapes returned by Wahoo API (numeric fields may arrive as strings)
+type NumLike = number | string | null | undefined
+
 interface WahooTokenResponse {
   access_token: string
   refresh_token: string
@@ -13,25 +19,27 @@ interface WahooTokenResponse {
 }
 
 interface WahooWorkoutSummaryRaw {
-  duration_in_seconds: string | null
-  distance_in_meters: string | null
-  calories: string | null
-  heart_rate_avg: string | null
-  heart_rate_max: string | null
-  power_avg: string | null
-  power_max: string | null
-  cadence_avg: string | null
-  normalized_power: string | null
-  tss: string | null
-  intensity_factor: string | null
+  ascent_accum?: NumLike
+  cadence_avg?: NumLike
+  calories_accum?: NumLike
+  distance_accum?: NumLike
+  duration_active_accum?: NumLike
+  duration_total_accum?: NumLike
+  heart_rate_avg?: NumLike
+  power_avg?: NumLike
+  power_bike_np_last?: NumLike
+  power_bike_tss_last?: NumLike
+  speed_avg?: NumLike
+  work_accum?: NumLike
+  time_zone?: string | null
 }
 
 interface WahooWorkoutRaw {
   id: number
-  name: string
+  name: string | null
   starts: string
-  minutes: number
-  workout_type_location_name: string
+  minutes: NumLike
+  workout_type_id: number | null
   workout_summary: WahooWorkoutSummaryRaw | null
 }
 
@@ -40,18 +48,25 @@ interface WahooWorkoutsResponse {
   total: number
   page: number
   per_page: number
-  order: string
+}
+
+export class WahooNotConnectedError extends Error {
+  constructor() {
+    super('Usuario no conectado a Wahoo')
+  }
 }
 
 export class WahooOAuthService {
   private readonly clientId: string
   private readonly clientSecret: string
   private readonly redirectUri: string
+  private readonly scopes: string
 
   constructor(private readonly tokenRepository: WahooTokenRepository) {
     this.clientId = process.env.WAHOO_CLIENT_ID ?? ''
     this.clientSecret = process.env.WAHOO_CLIENT_SECRET ?? ''
     this.redirectUri = process.env.WAHOO_REDIRECT_URI ?? ''
+    this.scopes = process.env.WAHOO_SCOPES?.trim() || DEFAULT_SCOPES
 
     if (!this.clientId || !this.clientSecret || !this.redirectUri) {
       console.warn('⚠️  Wahoo OAuth credentials not configured — integration disabled')
@@ -61,39 +76,25 @@ export class WahooOAuthService {
   // ─── Step 1: Build the authorization URL ────────────────────────────────────
 
   buildAuthorizationUrl(state: string): string {
-    const scopes = "email power_zones_read workouts_read plans_read routes_read offline_data user_read"
     const params = new URLSearchParams({
       client_id: this.clientId,
       redirect_uri: this.redirectUri,
-      // scope: process.env.WAHOO_SCOPES ??  "email power_zones_read workouts_read plans_read routes_read offline_data user_read",
       response_type: 'code',
       state,
     })
-    return `${WAHOO_BASE_URL}/oauth/authorize?${params.toString()}&scope=${encodeURIComponent(scopes)}`
+    // Wahoo expects spaces encoded as %20, not '+', so scope is appended manually
+    return `${WAHOO_BASE_URL}/oauth/authorize?${params.toString()}&scope=${encodeURIComponent(this.scopes)}`
   }
 
   // ─── Step 2: Exchange code for tokens ───────────────────────────────────────
 
   async exchangeCode(userId: string, code: string): Promise<WahooToken> {
-    const params = new URLSearchParams({
-      client_id: this.clientId,
-      client_secret: this.clientSecret,
+    const data = await this.requestToken({
       code,
       redirect_uri: this.redirectUri,
       grant_type: 'authorization_code',
-    })
+    }, 'token exchange')
 
-    const res = await fetch(`${WAHOO_BASE_URL}/oauth/token?${params.toString()}`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-    })
-
-    if (!res.ok) {
-      const body = await res.text()
-      throw new Error(`Wahoo token exchange failed: ${res.status} ${body}`)
-    }
-
-    const data = await res.json() as WahooTokenResponse
     const token = WahooToken.create({
       userId,
       accessToken: data.access_token,
@@ -109,26 +110,13 @@ export class WahooOAuthService {
 
   async refreshToken(userId: string): Promise<WahooToken> {
     const existing = await this.tokenRepository.findByUserId(userId)
-    if (!existing) throw new Error('No Wahoo token found for user')
+    if (!existing) throw new WahooNotConnectedError()
 
-    const params = new URLSearchParams({
-      client_id: this.clientId,
-      client_secret: this.clientSecret,
+    const data = await this.requestToken({
       refresh_token: existing.refreshToken,
       grant_type: 'refresh_token',
-    })
+    }, 'token refresh')
 
-    const res = await fetch(`${WAHOO_BASE_URL}/oauth/token?${params.toString()}`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-    })
-
-    if (!res.ok) {
-      const body = await res.text()
-      throw new Error(`Wahoo token refresh failed: ${res.status} ${body}`)
-    }
-
-    const data = await res.json() as WahooTokenResponse
     existing.accessToken = data.access_token
     existing.refreshToken = data.refresh_token
     existing.expiresAt = new Date(Date.now() + data.expires_in * 1000).toISOString()
@@ -141,7 +129,7 @@ export class WahooOAuthService {
 
   async getValidToken(userId: string): Promise<WahooToken> {
     const token = await this.tokenRepository.findByUserId(userId)
-    if (!token) throw new Error('Usuario no conectado a Wahoo')
+    if (!token) throw new WahooNotConnectedError()
 
     if (token.isExpired()) {
       return this.refreshToken(userId)
@@ -150,51 +138,40 @@ export class WahooOAuthService {
     return token
   }
 
-  // ─── Fetch recent workouts ───────────────────────────────────────────────────
+  // ─── Fetch one page of workouts (most recent first) ─────────────────────────
 
   async getWorkouts(userId: string, page = 1, perPage = 10): Promise<WahooWorkout[]> {
-    const token = await this.getValidToken(userId)
-
-    const params = new URLSearchParams({
-      page: String(page),
-      per_page: String(perPage),
-      order: 'desc',
-    })
-
-    const res = await fetch(`${WAHOO_BASE_URL}/v1/workouts?${params.toString()}`, {
-      headers: {
-        Authorization: `Bearer ${token.accessToken}`,
-        'Content-Type': 'application/json',
-      },
-    })
-
-    if (!res.ok) {
-      const body = await res.text()
-      throw new Error(`Wahoo workouts fetch failed: ${res.status} ${body}`)
-    }
-
-    const data = await res.json() as WahooWorkoutsResponse
+    const data = await this.fetchWorkoutsPage(userId, page, Math.min(perPage, MAX_PER_PAGE))
     return data.workouts.map(w => this.mapWorkout(w))
   }
 
-  // ─── Fetch single workout with summary ──────────────────────────────────────
+  // ─── Fetch every workout that started on or after `since` ───────────────────
+  // Wahoo always returns workouts sorted by `starts` descending, so we page
+  // until we reach one older than `since` or run out of results.
 
-  async getWorkoutWithSummary(userId: string, workoutId: number): Promise<WahooWorkout> {
-    const token = await this.getValidToken(userId)
+  async getWorkoutsSince(userId: string, since: Date): Promise<WahooWorkout[]> {
+    const result: WahooWorkout[] = []
 
-    const res = await fetch(`${WAHOO_BASE_URL}/v1/workouts/${workoutId}/workout_summary`, {
-      headers: {
-        Authorization: `Bearer ${token.accessToken}`,
-        'Content-Type': 'application/json',
-      },
-    })
+    for (let page = 1; page <= MAX_PAGES; page++) {
+      const data = await this.fetchWorkoutsPage(userId, page, MAX_PER_PAGE)
+      const workouts = data.workouts.map(w => this.mapWorkout(w))
 
-    if (!res.ok) {
-      const body = await res.text()
-      throw new Error(`Wahoo workout summary fetch failed: ${res.status} ${body}`)
+      for (const w of workouts) {
+        if (new Date(w.startedAt) >= since) result.push(w)
+      }
+
+      const oldest = workouts[workouts.length - 1]
+      const reachedEnd = workouts.length < MAX_PER_PAGE || page * MAX_PER_PAGE >= data.total
+      if (reachedEnd || !oldest || new Date(oldest.startedAt) < since) break
     }
 
-    const workout = await res.json() as WahooWorkoutRaw
+    return result
+  }
+
+  // ─── Fetch single workout (includes workout_summary) ────────────────────────
+
+  async getWorkout(userId: string, workoutId: number): Promise<WahooWorkout> {
+    const workout = await this.authorizedGet<WahooWorkoutRaw>(userId, `/v1/workouts/${workoutId}`, 'workout fetch')
     return this.mapWorkout(workout)
   }
 
@@ -205,36 +182,119 @@ export class WahooOAuthService {
     return token !== null
   }
 
-  // ─── Disconnect (revoke tokens) ──────────────────────────────────────────────
+  // ─── Disconnect: revoke permissions in Wahoo and delete local tokens ────────
 
   async disconnect(userId: string): Promise<void> {
+    try {
+      const token = await this.getValidToken(userId)
+      const res = await fetch(`${WAHOO_BASE_URL}/v1/permissions`, {
+        method: 'DELETE',
+        headers: { Authorization: `Bearer ${token.accessToken}` },
+      })
+      if (!res.ok && res.status !== 401) {
+        console.warn(`Wahoo revoke failed: ${res.status} ${await res.text()}`)
+      }
+    } catch (err) {
+      // Best effort: even if Wahoo is unreachable, the local tokens are removed
+      if (!(err instanceof WahooNotConnectedError)) console.warn('Wahoo revoke error:', err)
+    }
+
     await this.tokenRepository.deleteByUserId(userId)
   }
 
   // ─── Private helpers ─────────────────────────────────────────────────────────
 
+  private fetchWorkoutsPage(userId: string, page: number, perPage: number): Promise<WahooWorkoutsResponse> {
+    const params = new URLSearchParams({ page: String(page), per_page: String(perPage) })
+    return this.authorizedGet<WahooWorkoutsResponse>(userId, `/v1/workouts?${params.toString()}`, 'workouts fetch')
+  }
+
+  // GET against the Wahoo API; on 401 refreshes the token once and retries
+  private async authorizedGet<T>(userId: string, path: string, label: string): Promise<T> {
+    let token = await this.getValidToken(userId)
+
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const res = await fetch(`${WAHOO_BASE_URL}${path}`, {
+        headers: { Authorization: `Bearer ${token.accessToken}` },
+      })
+
+      if (res.status === 401 && attempt === 0) {
+        token = await this.refreshToken(userId)
+        continue
+      }
+
+      if (!res.ok) {
+        const body = await res.text()
+        throw new Error(`Wahoo ${label} failed: ${res.status} ${body}`)
+      }
+
+      return await res.json() as T
+    }
+
+    throw new Error(`Wahoo ${label} failed: unauthorized`)
+  }
+
+  private async requestToken(params: Record<string, string>, label: string): Promise<WahooTokenResponse> {
+    // Params go in the query string, as in Wahoo's documented examples
+    const query = new URLSearchParams({
+      client_id: this.clientId,
+      client_secret: this.clientSecret,
+      ...params,
+    })
+
+    const res = await fetch(`${WAHOO_BASE_URL}/oauth/token?${query.toString()}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+    })
+
+    if (!res.ok) {
+      const text = await res.text()
+      throw new Error(`Wahoo ${label} failed: ${res.status} ${text}`)
+    }
+
+    return await res.json() as WahooTokenResponse
+  }
+
   private mapWorkout(raw: WahooWorkoutRaw): WahooWorkout {
     const s = raw.workout_summary
+    const type = describeWorkoutType(raw.workout_type_id)
+    const speedMs = num(s?.speed_avg)
+    const workJ = num(s?.work_accum)
 
     return {
       id: raw.id,
-      name: raw.name ?? 'Entrenamiento',
+      name: raw.name || 'Entrenamiento',
       startedAt: raw.starts,
-      durationMinutes: raw.minutes,
-      workoutTypeLocationName: raw.workout_type_location_name ?? 'unknown',
+      durationMinutes: num(raw.minutes) ?? 0,
+      workoutTypeId: raw.workout_type_id ?? null,
+      workoutTypeName: type.name,
+      location: type.location,
       summary: s ? {
-        durationInSeconds: s.duration_in_seconds ? Number(s.duration_in_seconds) : null,
-        distanceInMeters:  s.distance_in_meters  ? Number(s.distance_in_meters)  : null,
-        calories:          s.calories            ? Number(s.calories)            : null,
-        heartRateAvg:      s.heart_rate_avg      ? Number(s.heart_rate_avg)      : null,
-        heartRateMax:      s.heart_rate_max      ? Number(s.heart_rate_max)      : null,
-        powerAvg:          s.power_avg           ? Number(s.power_avg)           : null,
-        powerMax:          s.power_max           ? Number(s.power_max)           : null,
-        cadenceAvg:        s.cadence_avg         ? Number(s.cadence_avg)         : null,
-        normalizedPower:   s.normalized_power    ? Number(s.normalized_power)    : null,
-        tss:               s.tss                 ? Number(s.tss)                 : null,
-        intensityFactor:   s.intensity_factor    ? Number(s.intensity_factor)    : null,
+        durationActiveSeconds: num(s.duration_active_accum),
+        durationTotalSeconds:  num(s.duration_total_accum),
+        distanceInMeters:      num(s.distance_accum),
+        ascentInMeters:        num(s.ascent_accum),
+        calories:              num(s.calories_accum),
+        heartRateAvg:          round(num(s.heart_rate_avg)),
+        powerAvg:              round(num(s.power_avg)),
+        normalizedPower:       round(num(s.power_bike_np_last)),
+        tss:                   round(num(s.power_bike_tss_last)),
+        cadenceAvg:            round(num(s.cadence_avg)),
+        speedAvgKmh:           speedMs !== null ? Math.round(speedMs * 3.6 * 10) / 10 : null,
+        workKj:                workJ !== null ? Math.round(workJ / 1000) : null,
+        timeZone:              s.time_zone ?? null,
       } : null,
     }
   }
+}
+
+// Wahoo sends numbers as strings (e.g. "215.0"); 0 or missing → null
+function num(v: NumLike): number | null {
+  if (v === null || v === undefined || v === '') return null
+  const n = Number(v)
+  return Number.isFinite(n) && n !== 0 ? n : null
+}
+
+function round(v: number | null): number | null {
+  return v === null ? null : Math.round(v)
 }

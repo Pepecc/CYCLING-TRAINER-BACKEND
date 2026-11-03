@@ -1,6 +1,12 @@
-import { WahooOAuthService } from '../../../infrastructure/wahoo/WahooOAuthService'
+import { WahooNotConnectedError } from '../../../infrastructure/wahoo/WahooOAuthService'
 import { CyclistProfileRepository } from '../../../domain/profile/CyclistProfileRepository'
+import { CyclistProfileFields, ProfileValidationError } from '../../../domain/profile/CyclistProfile'
 import { WahooWorkout } from '../../../domain/wahoo/WahooWorkout'
+import { WorkoutRepository } from '../../../domain/wahoo/WorkoutRepository'
+import { SyncWahooWorkouts } from '../../../application/wahoo/SyncWahooWorkouts'
+import { UpdateProfile } from '../../../application/profile/UpdateProfile'
+import { classifyPower, intensityFactor, workoutTss } from '../../../domain/training/trainingMetrics'
+import { dayKey, addDays, mondayKey, formatDayKey, formatDate } from '../../../domain/training/calendar'
 
 interface WeekBucket {
   weekStart: string
@@ -22,39 +28,84 @@ interface SeasonKpis {
   workoutsCount: number
 }
 
+// CTL/ATL need history before the period being reported, otherwise they start at 0
+const CTL_WARMUP_DAYS = 90
+
+// update_profile argument (snake_case, as the model sees it) → profile field
+const PROFILE_ARG_MAP: Record<string, keyof CyclistProfileFields> = {
+  ftp: 'ftp',
+  weight_kg: 'weightKg',
+  hours_per_week: 'hoursPerWeek',
+  goal: 'goal',
+  experience: 'experience',
+  max_hr: 'maxHr',
+  resting_hr: 'restingHr',
+  available_days: 'availableDays',
+  target_events: 'targetEvents',
+  limitations: 'limitations',
+}
+
 export class ToolExecutor {
   constructor(
-    private readonly wahooService: WahooOAuthService,
-    private readonly profileRepository: CyclistProfileRepository
+    private readonly syncWorkouts: SyncWahooWorkouts,
+    private readonly workoutRepository: WorkoutRepository,
+    private readonly profileRepository: CyclistProfileRepository,
+    private readonly updateProfileUseCase: UpdateProfile
   ) {}
 
+  // Never throws: errors are returned to the model as a tool result so the coach can answer normally
   async execute(userId: string, toolName: string, args: Record<string, unknown>): Promise<string> {
-    switch (toolName) {
-      case 'get_recent_workouts':
-        return this.getRecentWorkouts(userId, args)
-      case 'get_block_summary':
-        return this.getBlockSummary(userId, args)
-      case 'get_season_kpis':
-        return this.getSeasonKpis(userId)
-      default:
-        return JSON.stringify({ error: `Tool desconocida: ${toolName}` })
+    try {
+      switch (toolName) {
+        case 'get_recent_workouts':
+          return await this.getRecentWorkouts(userId, args)
+        case 'get_block_summary':
+          return await this.getBlockSummary(userId, args)
+        case 'get_season_kpis':
+          return await this.getSeasonKpis(userId)
+        case 'update_profile':
+          return await this.updateProfile(userId, args)
+        default:
+          return JSON.stringify({ error: `Tool desconocida: ${toolName}` })
+      }
+    } catch (err) {
+      if (err instanceof ProfileValidationError) {
+        return JSON.stringify({ error: 'dato_no_valido', mensaje: `${err.message}. No se ha guardado nada; confirma el dato con el ciclista.` })
+      }
+      if (err instanceof WahooNotConnectedError) {
+        return JSON.stringify({
+          error: 'wahoo_no_conectado',
+          mensaje: 'El usuario no ha conectado su cuenta de Wahoo. Sugiérele conectarla para analizar sus entrenos reales.',
+        })
+      }
+      console.error(`Tool ${toolName} failed:`, err)
+      if (toolName === 'update_profile') {
+        return JSON.stringify({ error: 'error_guardando', mensaje: 'No se ha podido guardar el perfil. Inténtalo más tarde.' })
+      }
+      return JSON.stringify({
+        error: 'wahoo_no_disponible',
+        mensaje: 'No se han podido obtener los datos de Wahoo en este momento. Inténtalo más tarde.',
+      })
     }
   }
 
   // ─── get_recent_workouts ──────────────────────────────────────────────────
 
   private async getRecentWorkouts(userId: string, args: Record<string, unknown>): Promise<string> {
-    const days = (args.days as number) ?? 7
-    const limit = (args.limit as number) ?? 5
+    const days = positiveInt(args.days, 7)
+    const limit = positiveInt(args.limit, 5)
 
-    const workouts = await this.wahooService.getWorkouts(userId, 1, 20)
-    const profile = await this.profileRepository.findByUserId(userId)
+    // days=1 → solo hoy (día local del ciclista)
+    const cutoffKey = addDays(dayKey(new Date()), -(days - 1))
 
-    const cutoff = new Date()
-    cutoff.setDate(cutoff.getDate() - days)
+    const [workouts, profile] = await Promise.all([
+      this.loadWorkouts(userId, keyToDate(addDays(cutoffKey, -1))),
+      this.profileRepository.findByUserId(userId),
+    ])
+    const ftp = profile?.ftp ?? null
 
     const filtered = workouts
-      .filter(w => new Date(w.startedAt) >= cutoff)
+      .filter(w => dayKey(new Date(w.startedAt)) >= cutoffKey)
       .slice(0, limit)
 
     if (filtered.length === 0) {
@@ -63,33 +114,38 @@ export class ToolExecutor {
 
     const result = filtered.map(w => {
       const s = w.summary
-      const date = new Date(w.startedAt).toLocaleDateString('es-ES', {
-        weekday: 'long', day: 'numeric', month: 'long',
-      })
-
       const entry: Record<string, unknown> = {
         id: w.id,
         nombre: w.name,
-        fecha: date,
-        tipo: w.workoutTypeLocationName,
+        fecha: formatDate(new Date(w.startedAt), { weekday: 'long', day: 'numeric', month: 'long' }),
+        tipo: w.workoutTypeName,
+        ubicacion: w.location,
         duracion_min: w.durationMinutes,
       }
 
       if (s) {
-        if (s.powerAvg)        entry.potencia_media_w = s.powerAvg
-        if (s.normalizedPower) entry.np_w = s.normalizedPower
-        if (s.powerMax)        entry.potencia_max_w = s.powerMax
-        if (s.heartRateAvg)    entry.fc_media_ppm = s.heartRateAvg
-        if (s.heartRateMax)    entry.fc_max_ppm = s.heartRateMax
-        if (s.cadenceAvg)      entry.cadencia_media_rpm = s.cadenceAvg
-        if (s.tss)             entry.tss = s.tss
-        if (s.intensityFactor) entry.if = s.intensityFactor
-        if (s.calories)        entry.calorias = s.calories
+        if (s.durationActiveSeconds) entry.tiempo_movimiento_min = Math.round(s.durationActiveSeconds / 60)
+        if (s.powerAvg)         entry.potencia_media_w = s.powerAvg
+        if (s.normalizedPower)  entry.np_w = s.normalizedPower
+        if (s.heartRateAvg)     entry.fc_media_ppm = s.heartRateAvg
+        if (s.cadenceAvg)       entry.cadencia_media_rpm = s.cadenceAvg
+        if (s.speedAvgKmh)      entry.velocidad_media_kmh = s.speedAvgKmh
         if (s.distanceInMeters) entry.distancia_km = +(s.distanceInMeters / 1000).toFixed(1)
+        if (s.ascentInMeters)   entry.desnivel_m = Math.round(s.ascentInMeters)
+        if (s.workKj)           entry.trabajo_kj = s.workKj
+        if (s.calories)         entry.calorias = Math.round(s.calories)
 
-        // Classify NP in power zones if FTP available
-        if (s.normalizedPower && profile?.ftp) {
-          entry.zona_predominante = this.classifyPower(s.normalizedPower, profile.ftp)
+        const { tss, estimated } = workoutTss(w, ftp)
+        if (tss) {
+          entry.tss = tss
+          if (estimated) entry.tss_estimado = true
+        }
+
+        const iF = intensityFactor(s.normalizedPower, ftp)
+        if (iF) entry.if = iF
+
+        if (s.normalizedPower && ftp) {
+          entry.zona_predominante = classifyPower(s.normalizedPower, ftp)
         }
       }
 
@@ -102,42 +158,42 @@ export class ToolExecutor {
   // ─── get_block_summary ────────────────────────────────────────────────────
 
   private async getBlockSummary(userId: string, args: Record<string, unknown>): Promise<string> {
-    const weeks = (args.weeks as number) ?? 6
+    const weeks = positiveInt(args.weeks, 6)
 
-    // Fetch enough workouts to cover the requested weeks
-    const workouts = await this.wahooService.getWorkouts(userId, 1, 50)
+    const firstMonday = addDays(mondayKey(dayKey(new Date())), -(weeks - 1) * 7)
 
-    const cutoff = new Date()
-    cutoff.setDate(cutoff.getDate() - weeks * 7)
+    const [workouts, profile] = await Promise.all([
+      this.loadWorkouts(userId, keyToDate(addDays(firstMonday, -1))),
+      this.profileRepository.findByUserId(userId),
+    ])
+    const ftp = profile?.ftp ?? null
 
-    const filtered = workouts.filter(w => new Date(w.startedAt) >= cutoff)
-
-    // Group by week (Monday-Sunday)
+    // Group by week (Monday-Sunday), including weeks without sessions
     const buckets = new Map<string, WahooWorkout[]>()
+    for (let i = 0; i < weeks; i++) buckets.set(addDays(firstMonday, i * 7), [])
 
-    filtered.forEach(w => {
-      const d = new Date(w.startedAt)
-      const monday = this.getMondayOf(d)
-      const key = monday.toISOString().split('T')[0]
-      if (!buckets.has(key)) buckets.set(key, [])
-      buckets.get(key)!.push(w)
+    workouts.forEach(w => {
+      const key = mondayKey(dayKey(new Date(w.startedAt)))
+      buckets.get(key)?.push(w)
     })
+
+    let estimatedCount = 0
 
     const summary: WeekBucket[] = Array.from(buckets.entries())
       .sort(([a], [b]) => a.localeCompare(b))
-      .map(([mondayStr, ws]) => {
-        const monday = new Date(mondayStr)
-        const sunday = new Date(monday)
-        sunday.setDate(monday.getDate() + 6)
-
-        const tss = ws.reduce((acc, w) => acc + (w.summary?.tss ?? 0), 0)
+      .map(([monday, ws]) => {
+        const tss = ws.reduce((acc, w) => {
+          const t = workoutTss(w, ftp)
+          if (t.estimated) estimatedCount++
+          return acc + (t.tss ?? 0)
+        }, 0)
         const hours = ws.reduce((acc, w) => acc + w.durationMinutes / 60, 0)
         const nps = ws.filter(w => w.summary?.normalizedPower).map(w => w.summary!.normalizedPower!)
         const npAvg = nps.length > 0 ? Math.round(nps.reduce((a, b) => a + b, 0) / nps.length) : null
 
         return {
-          weekStart: monday.toLocaleDateString('es-ES', { day: 'numeric', month: 'short' }),
-          weekEnd: sunday.toLocaleDateString('es-ES', { day: 'numeric', month: 'short' }),
+          weekStart: formatDayKey(monday, { day: 'numeric', month: 'short' }),
+          weekEnd: formatDayKey(addDays(monday, 6), { day: 'numeric', month: 'short' }),
           sessions: ws.length,
           tss: Math.round(tss),
           hours: +hours.toFixed(1),
@@ -156,6 +212,7 @@ export class ToolExecutor {
         tss_total: Math.round(totalTss),
         horas_totales: +totalHours.toFixed(1),
         tss_medio_semanal: avgTssPerWeek,
+        entrenos_con_tss_estimado: estimatedCount,
       },
     })
   }
@@ -163,55 +220,62 @@ export class ToolExecutor {
   // ─── get_season_kpis ──────────────────────────────────────────────────────
 
   private async getSeasonKpis(userId: string): Promise<string> {
-    // Fetch last 90 days to calculate CTL (42d) and ATL (7d)
-    const workouts = await this.wahooService.getWorkouts(userId, 1, 100)
+    const todayKey = dayKey(new Date())
+    const seasonStartKey = `${todayKey.slice(0, 4)}-01-01`
+    const warmupStartKey = addDays(seasonStartKey, -CTL_WARMUP_DAYS)
 
-    const now = new Date()
-    const seasonStart = new Date(now.getFullYear(), 0, 1) // Jan 1st current year
-
-    const seasonWorkouts = workouts.filter(w => new Date(w.startedAt) >= seasonStart)
-
-    // Sort chronologically for CTL/ATL calculation
-    const sorted = [...seasonWorkouts].sort(
-      (a, b) => new Date(a.startedAt).getTime() - new Date(b.startedAt).getTime()
-    )
+    const [workouts, profile] = await Promise.all([
+      this.loadWorkouts(userId, keyToDate(addDays(warmupStartKey, -1))),
+      this.profileRepository.findByUserId(userId),
+    ])
+    const ftp = profile?.ftp ?? null
 
     // CTL = 42-day exponential weighted average of TSS
     // ATL = 7-day exponential weighted average of TSS
     const ctlDecay = 1 - Math.exp(-1 / 42)
     const atlDecay = 1 - Math.exp(-1 / 7)
 
+    // Daily TSS map (local day)
+    const dailyTss = new Map<string, number>()
+    let workoutsWithoutTss = 0
+    let workoutsWithEstimatedTss = 0
+    const seasonWorkouts: WahooWorkout[] = []
+
+    workouts.forEach(w => {
+      const key = dayKey(new Date(w.startedAt))
+      if (key < warmupStartKey) return
+      const { tss, estimated } = workoutTss(w, ftp)
+      dailyTss.set(key, (dailyTss.get(key) ?? 0) + (tss ?? 0))
+      if (key >= seasonStartKey) {
+        seasonWorkouts.push(w)
+        if (tss === null) workoutsWithoutTss++
+        if (estimated) workoutsWithEstimatedTss++
+      }
+    })
+
     let ctl = 0
     let atl = 0
     let peakCtl = 0
-    let peakCtlDate: string | null = null
+    let peakCtlKey: string | null = null
+    let totalTss = 0
 
-    // Build daily TSS map
-    const dailyTss = new Map<string, number>()
-    sorted.forEach(w => {
-      const day = w.startedAt.split('T')[0]
-      dailyTss.set(day, (dailyTss.get(day) ?? 0) + (w.summary?.tss ?? 0))
-    })
-
-    // Iterate day by day from season start to today
-    const cursor = new Date(seasonStart)
-    while (cursor <= now) {
-      const key = cursor.toISOString().split('T')[0]
+    // Iterate day by day from warm-up start to today; peak and totals only count the season
+    for (let key = warmupStartKey; key <= todayKey; key = addDays(key, 1)) {
       const tss = dailyTss.get(key) ?? 0
 
       ctl = ctl + ctlDecay * (tss - ctl)
       atl = atl + atlDecay * (tss - atl)
 
-      if (ctl > peakCtl) {
-        peakCtl = ctl
-        peakCtlDate = cursor.toLocaleDateString('es-ES', { day: 'numeric', month: 'long' })
+      if (key >= seasonStartKey) {
+        totalTss += tss
+        if (ctl > peakCtl) {
+          peakCtl = ctl
+          peakCtlKey = key
+        }
       }
-
-      cursor.setDate(cursor.getDate() + 1)
     }
 
     const tsb = ctl - atl
-    const totalTss = seasonWorkouts.reduce((acc, w) => acc + (w.summary?.tss ?? 0), 0)
     const totalHours = seasonWorkouts.reduce((acc, w) => acc + w.durationMinutes / 60, 0)
 
     const kpis: SeasonKpis = {
@@ -221,35 +285,62 @@ export class ToolExecutor {
       totalHours: +totalHours.toFixed(1),
       totalTss: Math.round(totalTss),
       peakCtl: Math.round(peakCtl),
-      peakCtlDate,
+      peakCtlDate: peakCtlKey ? formatDayKey(peakCtlKey, { day: 'numeric', month: 'long' }) : null,
       workoutsCount: seasonWorkouts.length,
     }
 
-    const interpretation = this.interpretTsb(tsb)
+    return JSON.stringify({
+      kpis,
+      interpretacion_tsb: this.interpretTsb(tsb),
+      calidad_datos: {
+        entrenos_sin_tss: workoutsWithoutTss,
+        entrenos_con_tss_estimado: workoutsWithEstimatedTss,
+        nota: workoutsWithoutTss > 0
+          ? 'Algunos entrenos no tienen TSS (sin potenciómetro o sin FTP en el perfil); CTL/ATL pueden estar infravalorados.'
+          : undefined,
+      },
+    })
+  }
 
-    return JSON.stringify({ kpis, interpretacion_tsb: interpretation })
+  // ─── update_profile ───────────────────────────────────────────────────────
+
+  private async updateProfile(userId: string, args: Record<string, unknown>): Promise<string> {
+    const patch: Record<string, unknown> = {}
+    for (const [arg, field] of Object.entries(PROFILE_ARG_MAP)) {
+      if (args[arg] !== undefined) patch[field] = args[arg]
+    }
+
+    if (Object.keys(patch).length === 0) {
+      return JSON.stringify({ error: 'sin_datos', mensaje: 'No se ha indicado ningún dato que guardar.' })
+    }
+
+    const profile = await this.updateProfileUseCase.execute({ userId, ...(patch as Partial<CyclistProfileFields>) })
+
+    return JSON.stringify({
+      guardado: true,
+      campos_actualizados: Object.keys(args).filter(a => a in PROFILE_ARG_MAP && args[a] !== undefined),
+      perfil: {
+        ftp_w: profile.ftp,
+        peso_kg: profile.weightKg,
+        w_kg: profile.wattsPerKg,
+        horas_semana: profile.hoursPerWeek,
+        nivel: profile.experience,
+        objetivo: profile.goal,
+        fc_max: profile.maxHr,
+        fc_reposo: profile.restingHr,
+        dias_disponibles: profile.availableDays,
+        eventos_objetivo: profile.targetEvents,
+        limitaciones: profile.limitations,
+      },
+    })
   }
 
   // ─── Helpers ─────────────────────────────────────────────────────────────
 
-  private getMondayOf(date: Date): Date {
-    const d = new Date(date)
-    const day = d.getDay()
-    const diff = d.getDate() - day + (day === 0 ? -6 : 1)
-    d.setDate(diff)
-    d.setHours(0, 0, 0, 0)
-    return d
-  }
-
-  private classifyPower(power: number, ftp: number): string {
-    const ratio = power / ftp
-    if (ratio < 0.55) return 'Z1 — Recuperación activa'
-    if (ratio < 0.75) return 'Z2 — Resistencia'
-    if (ratio < 0.90) return 'Z3 — Tempo'
-    if (ratio < 1.05) return 'Z4 — Umbral láctico'
-    if (ratio < 1.20) return 'Z5 — VO2max'
-    if (ratio < 1.50) return 'Z6 — Capacidad anaeróbica'
-    return 'Z7 — Potencia neuromuscular'
+  // Syncs with Wahoo (throttled, incremental) and reads from the local copy
+  private async loadWorkouts(userId: string, since: Date): Promise<WahooWorkout[]> {
+    await this.syncWorkouts.execute(userId)
+    return this.workoutRepository.findSince(userId, since)
   }
 
   private interpretTsb(tsb: number): string {
@@ -260,4 +351,14 @@ export class ToolExecutor {
     if (tsb > -30) return 'Carga alta — monitorizar recuperación, evitar esfuerzos máximos'
     return 'Sobreentrenamiento — recuperación urgente necesaria'
   }
+}
+
+function positiveInt(value: unknown, fallback: number): number {
+  const n = Math.floor(Number(value))
+  return Number.isFinite(n) && n > 0 ? n : fallback
+}
+
+// Start of a local day key, as an instant (approximate to UTC; callers subtract a margin day)
+function keyToDate(key: string): Date {
+  return new Date(`${key}T00:00:00Z`)
 }

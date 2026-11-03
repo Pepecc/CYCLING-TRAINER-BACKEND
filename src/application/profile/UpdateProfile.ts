@@ -1,34 +1,16 @@
-import { CyclistProfile, Experience } from '../../domain/profile/CyclistProfile'
+import { CyclistProfile, CyclistProfileFields } from '../../domain/profile/CyclistProfile'
 import { CyclistProfileRepository } from '../../domain/profile/CyclistProfileRepository'
 
-interface UpdateProfileInput {
-  userId: string
-  ftp?: number | null
-  weightKg?: number | null
-  hoursPerWeek?: number | null
-  goal?: string | null
-  experience?: Experience
-}
+// undefined = no tocar el campo, null = borrarlo
+export type UpdateProfileInput = { userId: string } & Partial<CyclistProfileFields>
 
 export class UpdateProfile {
   constructor(private readonly profileRepository: CyclistProfileRepository) {}
 
-  async execute(input: UpdateProfileInput): Promise<CyclistProfile> {
-    const { userId, ftp, weightKg, hoursPerWeek, goal, experience } = input
-
-    let profile = await this.profileRepository.findByUserId(userId)
-
-    if (profile) {
-      if (ftp !== undefined)          profile.ftp = ftp
-      if (weightKg !== undefined)     profile.weightKg = weightKg
-      if (hoursPerWeek !== undefined) profile.hoursPerWeek = hoursPerWeek
-      if (goal !== undefined)         profile.goal = goal
-      if (experience !== undefined)   profile.experience = experience
-      profile.updatedAt = new Date().toISOString()
-    } else {
-      profile = CyclistProfile.create({ userId, ftp, weightKg, hoursPerWeek, goal, experience })
-    }
-
+  // Throws ProfileValidationError if any value is out of range
+  async execute({ userId, ...patch }: UpdateProfileInput): Promise<CyclistProfile> {
+    const profile = (await this.profileRepository.findByUserId(userId)) ?? CyclistProfile.create(userId)
+    profile.update(patch)
     await this.profileRepository.save(profile)
     return profile
   }
