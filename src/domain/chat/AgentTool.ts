@@ -1,9 +1,15 @@
 // Tipos que representan las tool definitions que se pasan a OpenAI
 
+// Subconjunto de JSON Schema que aceptan las tools (admite objetos y listas anidados)
 export interface AgentToolParameter {
   type: string
-  description: string
+  description?: string
   enum?: string[]
+  items?: AgentToolParameter
+  properties?: Record<string, AgentToolParameter>
+  required?: string[]
+  minItems?: number
+  maxItems?: number
 }
 
 export interface AgentToolFunction {

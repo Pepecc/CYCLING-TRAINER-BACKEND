@@ -7,6 +7,8 @@ import { SyncWahooWorkouts } from '../../../application/wahoo/SyncWahooWorkouts'
 import { UpdateProfile } from '../../../application/profile/UpdateProfile'
 import { classifyPower, classifyHeartRate, intensityFactor, workoutTss, TssSource } from '../../../domain/training/trainingMetrics'
 import { dayKey, addDays, mondayKey, formatDayKey, formatDate } from '../../../domain/training/calendar'
+import { PlanValidationError, PlannedWorkoutNotFoundError } from '../../../domain/planning/PlannedWorkout'
+import { PlanningTools, PLANNING_TOOLS } from './PlanningTools'
 
 interface WeekBucket {
   weekStart: string
@@ -56,7 +58,8 @@ export class ToolExecutor {
     private readonly syncWorkouts: SyncWahooWorkouts,
     private readonly workoutRepository: WorkoutRepository,
     private readonly profileRepository: CyclistProfileRepository,
-    private readonly updateProfileUseCase: UpdateProfile
+    private readonly updateProfileUseCase: UpdateProfile,
+    private readonly planningTools: PlanningTools
   ) {}
 
   // Never throws: errors are returned to the model as a tool result so the coach can answer normally
@@ -71,12 +74,23 @@ export class ToolExecutor {
           return await this.getSeasonKpis(userId)
         case 'update_profile':
           return await this.updateProfile(userId, args)
+        case 'get_training_plan':
+        case 'save_planned_workout':
+        case 'update_planned_workout':
+        case 'delete_planned_workout':
+          return await this.planningTools.execute(userId, toolName, args)
         default:
           return JSON.stringify({ error: `Tool desconocida: ${toolName}` })
       }
     } catch (err) {
       if (err instanceof ProfileValidationError) {
         return JSON.stringify({ error: 'dato_no_valido', mensaje: `${err.message}. No se ha guardado nada; confirma el dato con el ciclista.` })
+      }
+      if (err instanceof PlanValidationError) {
+        return JSON.stringify({ error: 'dato_no_valido', mensaje: `${err.message}. No se ha guardado nada; corrige el dato y vuelve a intentarlo.` })
+      }
+      if (err instanceof PlannedWorkoutNotFoundError) {
+        return JSON.stringify({ error: 'no_encontrado', mensaje: 'No existe un entreno planificado con ese id. Consulta el plan con get_training_plan.' })
       }
       if (err instanceof WahooNotConnectedError) {
         return JSON.stringify({
@@ -87,6 +101,9 @@ export class ToolExecutor {
       console.error(`Tool ${toolName} failed:`, err)
       if (toolName === 'update_profile') {
         return JSON.stringify({ error: 'error_guardando', mensaje: 'No se ha podido guardar el perfil. Inténtalo más tarde.' })
+      }
+      if (PLANNING_TOOLS.includes(toolName)) {
+        return JSON.stringify({ error: 'plan_no_disponible', mensaje: 'No se ha podido acceder al plan de entrenamiento en este momento. Inténtalo más tarde.' })
       }
       return JSON.stringify({
         error: 'wahoo_no_disponible',

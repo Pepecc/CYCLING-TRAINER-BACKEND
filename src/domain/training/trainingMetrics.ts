@@ -64,8 +64,14 @@ export function estimateHrTss(
 ): number | null {
   const hrr = heartRateReserve(hrAvg, maxHr, restingHr)
   if (!seconds || hrr === null || hrr <= 0) return null
+  return Math.round((seconds / 3600) * hrTssPerHour(hrr))
+}
+
+// hrTSS que suma una hora a una fracción de la FC de reserva dada (100 en el umbral)
+export function hrTssPerHour(hrr: number): number {
+  if (hrr <= 0) return 0
   const x = Math.min(hrr, 1.1)
-  return Math.round((seconds / 3600) * (trimpWeight(x) / trimpWeight(HR_THRESHOLD_HRR)) * 100)
+  return (trimpWeight(x) / trimpWeight(HR_THRESHOLD_HRR)) * 100
 }
 
 // ─── Carga de un entreno ─────────────────────────────────────────────────────

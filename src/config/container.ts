@@ -5,6 +5,7 @@ import { FirestoreConversationRepository } from '../infrastructure/persistence/f
 import { FirestoreWahooTokenRepository } from '../infrastructure/persistence/firestore/FirestoreWahooTokenRepository'
 import { FirestoreOAuthStateRepository } from '../infrastructure/persistence/firestore/FirestoreOAuthStateRepository'
 import { FirestoreWorkoutRepository } from '../infrastructure/persistence/firestore/FirestoreWorkoutRepository'
+import { FirestorePlannedWorkoutRepository } from '../infrastructure/persistence/firestore/FirestorePlannedWorkoutRepository'
 import { OAuthStateRepository } from '../domain/wahoo/OAuthStateRepository'
 import { OpenAIAdapter } from '../infrastructure/ai/OpenAIAdapter'
 import { WahooOAuthService } from '../infrastructure/wahoo/WahooOAuthService'
@@ -20,6 +21,11 @@ import { AnalyzeWahooWorkout } from '../application/wahoo/AnalyzeWahooWorkout'
 import { SyncWahooWorkouts } from '../application/wahoo/SyncWahooWorkouts'
 import { DisconnectWahoo } from '../application/wahoo/DisconnectWahoo'
 import { ToolExecutor } from '../infrastructure/ai/tools/ToolExecutor'
+import { PlanningTools } from '../infrastructure/ai/tools/PlanningTools'
+import { SavePlannedWorkouts } from '../application/planning/SavePlannedWorkouts'
+import { UpdatePlannedWorkout } from '../application/planning/UpdatePlannedWorkout'
+import { DeletePlannedWorkout } from '../application/planning/DeletePlannedWorkout'
+import { GetTrainingPlan } from '../application/planning/GetTrainingPlan'
 
 export interface Container {
   updateProfile:       UpdateProfile
@@ -33,6 +39,10 @@ export interface Container {
   getWahooWorkouts:    GetWahooWorkouts
   analyzeWahooWorkout: AnalyzeWahooWorkout
   disconnectWahoo:     DisconnectWahoo
+  savePlannedWorkouts: SavePlannedWorkouts
+  updatePlannedWorkout: UpdatePlannedWorkout
+  deletePlannedWorkout: DeletePlannedWorkout
+  getTrainingPlan:     GetTrainingPlan
 }
 
 export function buildContainer(): Container {
@@ -46,6 +56,7 @@ export function buildContainer(): Container {
   const wahooTokenRepository   = new FirestoreWahooTokenRepository(db)
   const oauthStateRepository   = new FirestoreOAuthStateRepository(db)
   const workoutRepository      = new FirestoreWorkoutRepository(db)
+  const plannedWorkoutRepository = new FirestorePlannedWorkoutRepository(db)
 
   // --- Configure Firebase auth middleware ---
   configureAuth(userRepository)
@@ -57,7 +68,12 @@ export function buildContainer(): Container {
   // --- Use cases ---
   const updateProfile = new UpdateProfile(profileRepository)
   const syncWorkouts  = new SyncWahooWorkouts(wahooService, workoutRepository)
-  const toolExecutor  = new ToolExecutor(syncWorkouts, workoutRepository, profileRepository, updateProfile)
+  const savePlannedWorkouts  = new SavePlannedWorkouts(plannedWorkoutRepository, profileRepository)
+  const updatePlannedWorkout = new UpdatePlannedWorkout(plannedWorkoutRepository, profileRepository)
+  const deletePlannedWorkout = new DeletePlannedWorkout(plannedWorkoutRepository)
+  const getTrainingPlan      = new GetTrainingPlan(plannedWorkoutRepository, profileRepository)
+  const planningTools = new PlanningTools(savePlannedWorkouts, updatePlannedWorkout, deletePlannedWorkout, getTrainingPlan, profileRepository)
+  const toolExecutor  = new ToolExecutor(syncWorkouts, workoutRepository, profileRepository, updateProfile, planningTools)
   const sendMessage   = new SendMessage(conversationRepository, profileRepository, aiPort, toolExecutor)
 
   return {
@@ -72,5 +88,9 @@ export function buildContainer(): Container {
     getWahooWorkouts:    new GetWahooWorkouts(syncWorkouts, workoutRepository),
     analyzeWahooWorkout: new AnalyzeWahooWorkout(wahooService, profileRepository),
     disconnectWahoo:     new DisconnectWahoo(wahooService, workoutRepository),
+    savePlannedWorkouts,
+    updatePlannedWorkout,
+    deletePlannedWorkout,
+    getTrainingPlan,
   }
 }

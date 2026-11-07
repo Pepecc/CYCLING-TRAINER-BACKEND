@@ -6,7 +6,8 @@ import { AgentTool, ToolResult } from '../../domain/chat/AgentTool'
 export class OpenAIAdapter implements AIPort {
   private readonly client: OpenAI
   private readonly model: string
-  private readonly maxTokens = 1024
+  // A week of structured workouts in one save_planned_workout call needs well over 1024 tokens
+  private readonly maxTokens = Number(process.env.OPENAI_MAX_TOKENS) || 4096
 
   constructor() {
     this.client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY })

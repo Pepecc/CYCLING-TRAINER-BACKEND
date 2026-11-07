@@ -1,4 +1,67 @@
-import { AgentTool } from '../../../domain/chat/AgentTool'
+import { AgentTool, AgentToolParameter } from '../../../domain/chat/AgentTool'
+import {
+  STEP_KINDS, TARGET_TYPES, WORKOUT_FOCUSES, ENVIRONMENTS, PLANNED_STATUSES,
+} from '../../../domain/planning/PlannedWorkout'
+
+// ─── Esquema de un entreno planificado (compartido por save y update) ────────
+
+const targetSchema: AgentToolParameter = {
+  type: 'object',
+  description: `Objetivo de intensidad del paso.
+    hr_zone: zona de FC (1-5) en "zone" y opcionalmente "zone_max" para un rango (p.ej. Z1-Z2). Es el objetivo por defecto en bici estática con pulsómetro.
+    power_zone: zona de potencia de Coggan (1-7) en "zone" / "zone_max".
+    ftp_percent: % del FTP en "min" / "max" (p.ej. 88-94).
+    power_w: vatios en "min" / "max". hr_bpm: ppm en "min" / "max". rpe: esfuerzo percibido 1-10 en "min" / "max".
+    open: sin objetivo (rodar libre).`,
+  properties: {
+    type: { type: 'string', enum: TARGET_TYPES },
+    zone: { type: 'number', description: 'Zona (hr_zone, power_zone)' },
+    zone_max: { type: 'number', description: 'Zona superior de un rango de zonas (opcional)' },
+    min: { type: 'number', description: 'Valor mínimo (ftp_percent, power_w, hr_bpm, rpe)' },
+    max: { type: 'number', description: 'Valor máximo (opcional; si falta, igual al mínimo)' },
+  },
+  required: ['type'],
+}
+
+const stepSchema: AgentToolParameter = {
+  type: 'object',
+  properties: {
+    kind: { type: 'string', enum: STEP_KINDS, description: 'warmup calentamiento · work trabajo · recovery recuperación entre series · steady ritmo continuo · cooldown vuelta a la calma' },
+    duration_min: { type: 'number', description: 'Duración en minutos (admite decimales, p.ej. 0.5 = 30 s)' },
+    target: targetSchema,
+    cadence_min: { type: 'number', description: 'Cadencia mínima en rpm (opcional)' },
+    cadence_max: { type: 'number', description: 'Cadencia máxima en rpm (opcional)' },
+    notes: { type: 'string', description: 'Indicación breve para el paso (opcional)' },
+  },
+  required: ['kind', 'duration_min', 'target'],
+}
+
+const blockSchema: AgentToolParameter = {
+  type: 'object',
+  description: 'Bloque de pasos que se repite "repeat" veces. Las series van en un bloque: 4 × (8 min Z4 + 4 min Z1) = repeat 4 con dos pasos.',
+  properties: {
+    name: { type: 'string', description: 'Nombre del bloque, p.ej. "Calentamiento" o "Series" (opcional)' },
+    repeat: { type: 'number', description: 'Repeticiones del bloque. Default: 1' },
+    steps: { type: 'array', items: stepSchema, minItems: 1 },
+  },
+  required: ['steps'],
+}
+
+const workoutProperties: Record<string, AgentToolParameter> = {
+  date: { type: 'string', description: 'Fecha del entreno, AAAA-MM-DD' },
+  title: { type: 'string', description: 'Título corto, p.ej. "Umbral 4×8"' },
+  focus: { type: 'string', enum: WORKOUT_FOCUSES, description: 'Objetivo principal de la sesión. "rest" = día de descanso' },
+  environment: { type: 'string', enum: ENVIRONMENTS, description: 'indoor (bici estática / rodillo), outdoor (carretera) o any' },
+  description: { type: 'string', description: 'Objetivo de la sesión y cómo ejecutarla, en 1-3 frases' },
+  blocks: {
+    type: 'array',
+    items: blockSchema,
+    description: 'Estructura completa en orden: calentamiento, parte principal y vuelta a la calma. La duración y el TSS se calculan solos a partir de ella.',
+  },
+  duration_min: { type: 'number', description: 'Duración total en minutos. Solo para entrenos sin estructura (fuerza, salida libre)' },
+  tss: { type: 'number', description: 'TSS previsto. Solo para entrenos sin estructura' },
+  notes: { type: 'string', description: 'Notas adicionales (nutrición, material, alternativas...)' },
+}
 
 export const toolDefinitions: AgentTool[] = [
   {
@@ -87,6 +150,78 @@ export const toolDefinitions: AgentTool[] = [
           target_events: { type: 'string', description: 'Eventos o competiciones objetivo con sus fechas, p.ej. "Quebrantahuesos 20/06/2027"' },
           limitations: { type: 'string', description: 'Lesiones, molestias o limitaciones físicas relevantes' },
         },
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'get_training_plan',
+      description: `Obtiene los entrenos planificados del ciclista entre dos fechas, con su estructura,
+        duración, TSS previsto y estado (planned, done, partial, skipped), y los totales por semana.
+        Úsalo antes de planificar (para no duplicar sesiones), cuando pregunte qué le toca hoy o esta semana,
+        o antes de modificar un entreno (necesitas su id).`,
+      parameters: {
+        type: 'object',
+        properties: {
+          from: { type: 'string', description: 'Fecha inicial AAAA-MM-DD. Default: hoy' },
+          to: { type: 'string', description: 'Fecha final AAAA-MM-DD (incluida). Default: 14 días desde la inicial' },
+        },
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'save_planned_workout',
+      description: `Guarda uno o varios entrenos en el plan del ciclista (hasta 21 a la vez, p.ej. una semana entera).
+        Úsalo cuando hayas acordado con el ciclista una sesión o un plan y quiera tenerlo guardado.
+        Cada entreno con estructura detallada en bloques y pasos; los días de descanso, con focus "rest" y sin bloques.
+        Si algún entreno no es válido no se guarda ninguno: corrige el error y vuelve a llamar.`,
+      parameters: {
+        type: 'object',
+        properties: {
+          workouts: {
+            type: 'array',
+            minItems: 1,
+            maxItems: 21,
+            items: { type: 'object', properties: workoutProperties, required: ['date', 'title', 'focus', 'environment'] },
+          },
+        },
+        required: ['workouts'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'update_planned_workout',
+      description: `Modifica un entreno planificado por su id (obtenlo con get_training_plan).
+        Envía solo los campos que cambian: date para moverlo de día, blocks para sustituir toda la estructura,
+        status para marcarlo como hecho (done), parcial (partial), saltado (skipped) o pendiente (planned).`,
+      parameters: {
+        type: 'object',
+        properties: {
+          id: { type: 'string', description: 'id del entreno planificado' },
+          ...workoutProperties,
+          status: { type: 'string', enum: PLANNED_STATUSES, description: 'Estado del entreno' },
+        },
+        required: ['id'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'delete_planned_workout',
+      description: `Borra un entreno planificado por su id. Úsalo solo si el ciclista lo pide o acepta
+        quitar la sesión del plan; para moverla de día usa update_planned_workout.`,
+      parameters: {
+        type: 'object',
+        properties: {
+          id: { type: 'string', description: 'id del entreno planificado' },
+        },
+        required: ['id'],
       },
     },
   },
