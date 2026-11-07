@@ -37,7 +37,6 @@ export interface CyclistProfileFields {
   maxHr: number | null            // FC máxima (ppm)
   restingHr: number | null        // FC en reposo (ppm)
   availableDays: string | null    // p.ej. "martes, jueves, sábado y domingo"
-  targetEvents: string | null     // eventos y fechas objetivo de la temporada
   limitations: string | null      // lesiones, molestias, limitaciones físicas
 }
 
@@ -69,7 +68,6 @@ export class CyclistProfile implements CyclistProfileProps {
   maxHr: number | null
   restingHr: number | null
   availableDays: string | null
-  targetEvents: string | null
   limitations: string | null
   updatedAt: string
 
@@ -83,7 +81,6 @@ export class CyclistProfile implements CyclistProfileProps {
     this.maxHr = props.maxHr
     this.restingHr = props.restingHr
     this.availableDays = props.availableDays
-    this.targetEvents = props.targetEvents
     this.limitations = props.limitations
     this.updatedAt = props.updatedAt
   }
@@ -99,7 +96,6 @@ export class CyclistProfile implements CyclistProfileProps {
       maxHr: null,
       restingHr: null,
       availableDays: null,
-      targetEvents: null,
       limitations: null,
       updatedAt: new Date().toISOString(),
     })
@@ -125,7 +121,7 @@ export class CyclistProfile implements CyclistProfileProps {
       throw new ProfileValidationError('La FC en reposo debe ser menor que la FC máxima')
     }
 
-    for (const key of ['goal', 'availableDays', 'targetEvents', 'limitations'] as const) {
+    for (const key of ['goal', 'availableDays', 'limitations'] as const) {
       const v = next[key]
       if (v === null) continue
       if (typeof v !== 'string') throw new ProfileValidationError(`Valor no válido en ${key}`)
@@ -152,7 +148,6 @@ export class CyclistProfile implements CyclistProfileProps {
       maxHr: this.maxHr,
       restingHr: this.restingHr,
       availableDays: this.availableDays,
-      targetEvents: this.targetEvents,
       limitations: this.limitations,
     }
   }

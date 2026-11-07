@@ -11,7 +11,7 @@ interface ProfileContainer {
 
 const EDITABLE_FIELDS: Array<keyof CyclistProfileFields> = [
   'ftp', 'weightKg', 'hoursPerWeek', 'goal', 'experience',
-  'maxHr', 'restingHr', 'availableDays', 'targetEvents', 'limitations',
+  'maxHr', 'restingHr', 'availableDays', 'limitations',
 ]
 
 export function createProfileRouter({ getProfile, updateProfile }: ProfileContainer): Router {

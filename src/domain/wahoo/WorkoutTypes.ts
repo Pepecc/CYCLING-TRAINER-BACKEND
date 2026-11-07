@@ -28,3 +28,11 @@ export function describeWorkoutType(id: number | null | undefined): { name: stri
   if (INDOOR[id])  return { name: INDOOR[id],  location: 'indoor' }
   return { name: 'UNKNOWN', location: 'unknown' }
 }
+
+// Tipos de Wahoo que no son de bici: no se enlazan con el plan. Los dudosos (OTHER, WORKOUT,
+// TICKR_OFFLINE, UNKNOWN…) cuentan como bici: la estática con pulsómetro puede quedar registrada así.
+const NON_CYCLING = /^(RUNNING|WALKING|HIKING|MOUNTAINEERING|SWIMMING|SNOWBOARDING|SKIING|SKATING|LONG_BOARDING|SAILING|WINDSURFING|CANOEING|KAYAKING|ROWING|KITEBOARDING|STAND_UP|GOLFING|YOGA|MENTAL_STRENGTH|STAIR_CLIMBER|FE_TREADMILL|FE_ELLIPTICAL|FE_ROWER|FE_CLIMBER|BIKING_MOTOCYCLING)/
+
+export function isCyclingWorkoutType(name: string): boolean {
+  return !NON_CYCLING.test(name)
+}

@@ -1,5 +1,7 @@
 import { Conversation } from '../../domain/chat/Conversation'
-import { Message } from '../../domain/chat/Message'
+import { randomUUID } from 'crypto'
+import { APIMessage, Message, MessageAttachment } from '../../domain/chat/Message'
+import { ImageInput, parseImages } from '../../domain/chat/ImageAttachment'
 import { ConversationRepository } from '../../domain/chat/ConversationRepository'
 import { CyclistProfileRepository } from '../../domain/profile/CyclistProfileRepository'
 import { CyclistProfile } from '../../domain/profile/CyclistProfile'
@@ -7,8 +9,18 @@ import { AIPort, ToolExecutorFn } from '../../domain/chat/AIPort'
 import { ToolExecutor } from '../../infrastructure/ai/tools/ToolExecutor'
 import { toolDefinitions } from '../../infrastructure/ai/tools/ToolDefinitions'
 
-import { formatDate } from '../../domain/training/calendar'
+import { formatDate, formatDayKey } from '../../domain/training/calendar'
 import { Experience } from '../../domain/profile/CyclistProfile'
+import { SeasonPlan } from '../../domain/events/seasonPlan'
+import { GetSeasonPlan } from '../events/GetSeasonPlan'
+import { PHASE_GUIDE, PHASE_LABELS } from '../../infrastructure/ai/tools/SeasonTools'
+import { ReconcilePlan, ReconcileOutcome } from '../planning/ReconcilePlan'
+import { dayKey, mondayKey } from '../../domain/training/calendar'
+
+const MAX_RACES_IN_PROMPT = 8
+const CONTEXT_MESSAGES = 20
+// Images are sent again only while they are among the last messages (each one costs ~1000 tokens)
+const IMAGE_CONTEXT_MESSAGES = 6
 
 import fs from 'fs';
 import path from 'path';
@@ -28,6 +40,7 @@ interface SendMessageInput {
   userId: string
   content: string
   conversationId?: string | null
+  images?: unknown              // [{ mediaType, data (base64), name? }], se valida
 }
 
 interface SendMessageOutput {
@@ -40,11 +53,15 @@ export class SendMessage {
     private readonly conversationRepository: ConversationRepository,
     private readonly profileRepository: CyclistProfileRepository,
     private readonly aiPort: AIPort,
-    private readonly toolExecutor: ToolExecutor | null = null
+    private readonly toolExecutor: ToolExecutor | null = null,
+    private readonly getSeasonPlan: GetSeasonPlan | null = null,
+    private readonly reconcilePlan: ReconcilePlan | null = null
   ) {}
 
-  async execute({ userId, content, conversationId }: SendMessageInput): Promise<SendMessageOutput> {
-    if (!content.trim()) throw new Error('El mensaje no puede estar vacío')
+  async execute({ userId, content: rawContent, conversationId, images: rawImages }: SendMessageInput): Promise<SendMessageOutput> {
+    const content = typeof rawContent === 'string' ? rawContent.trim() : ''
+    const images = parseImages(rawImages)   // throws ImageValidationError
+    if (!content && images.length === 0) throw new Error('El mensaje no puede estar vacío')
 
     // Load or create conversation
     let conversation: Conversation
@@ -53,18 +70,24 @@ export class SendMessage {
       if (!found || found.userId !== userId) throw new Error('Conversación no encontrada')
       conversation = found
     } else {
-      conversation = Conversation.create({ userId, title: content.slice(0, 50) })
+      conversation = Conversation.create({ userId, title: content.slice(0, 50) || 'Imagen' })
       await this.conversationRepository.save(conversation)
     }
 
-    const profile = await this.profileRepository.findByUserId(userId)
-    const systemPrompt = this.buildSystemPrompt(profile)
+    const [profile, season, week] = await Promise.all([
+      this.profileRepository.findByUserId(userId),
+      this.loadSeason(userId),
+      this.loadWeek(userId),
+    ])
+    const systemPrompt = this.buildSystemPrompt(profile, season, week)
 
-    // Persist user message
+    // Persist the images (one document each), then the user message that references them
+    const attachments = await this.saveImages(userId, conversation.id, images)
     const userMessage = Message.create({
       conversationId: conversation.id,
       role: 'user',
-      content: content.trim(),
+      content,
+      attachments,
     })
     await this.conversationRepository.saveMessage(userId, userMessage)
     conversation.addMessage(userMessage)
@@ -76,7 +99,7 @@ export class SendMessage {
       : undefined
 
     // Call AI — pass tools only if executor is available
-    const contextMessages = conversation.getContextMessages(20)
+    const contextMessages = await this.buildContext(userId, conversation, userMessage, images)
     const tools = executeTool ? toolDefinitions : undefined
     const assistantContent = await this.aiPort.complete(systemPrompt, contextMessages, tools, executeTool)
 
@@ -91,7 +114,92 @@ export class SendMessage {
     return { conversationId: conversation.id, message: assistantMessage }
   }
 
-  private buildSystemPrompt(profile: CyclistProfile | null): string {
+  private async saveImages(userId: string, conversationId: string, images: ImageInput[]): Promise<MessageAttachment[]> {
+    return Promise.all(images.map(async (img, i) => {
+      const attachment: MessageAttachment = {
+        id: randomUUID(),
+        mediaType: img.mediaType,
+        name: img.name ?? `imagen-${i + 1}`,
+        sizeBytes: Buffer.byteLength(img.data, 'base64'),
+      }
+      await this.conversationRepository.saveAttachment(userId, conversationId, { ...attachment, data: img.data })
+      return attachment
+    }))
+  }
+
+  // Last messages in API format; recent ones keep their images so the coach can still look at them
+  private async buildContext(
+    userId: string, conversation: Conversation, current: Message, currentImages: ImageInput[]
+  ): Promise<APIMessage[]> {
+    const recent = conversation.messages.slice(-CONTEXT_MESSAGES)
+    return Promise.all(recent.map(async (m, i) => {
+      const api = m.toAPIFormat()
+      if (m.attachments.length === 0 || i < recent.length - IMAGE_CONTEXT_MESSAGES) return api
+      if (m.id === current.id) {
+        return { ...api, images: currentImages.map(img => ({ mediaType: img.mediaType, data: img.data })) }
+      }
+      const stored = await Promise.all(
+        m.attachments.map(a => this.conversationRepository.findAttachment(userId, conversation.id, a.id))
+      )
+      const found = stored.filter((a): a is NonNullable<typeof a> => a !== null)
+      return found.length ? { ...api, images: found.map(a => ({ mediaType: a.mediaType, data: a.data })) } : api
+    }))
+  }
+
+  private async loadSeason(userId: string): Promise<SeasonPlan | null> {
+    if (!this.getSeasonPlan) return null
+    try {
+      return await this.getSeasonPlan.execute(userId)
+    } catch (err) {
+      console.error('Season plan for the system prompt failed:', err)
+      return null
+    }
+  }
+
+  // This week so far, linked with Wahoo (null without Wahoo or if it fails: the chat must keep working)
+  private async loadWeek(userId: string): Promise<ReconcileOutcome | null> {
+    if (!this.reconcilePlan) return null
+    try {
+      const today = dayKey(new Date())
+      const outcome = await this.reconcilePlan.execute(userId, mondayKey(today), today)
+      return outcome.linked ? outcome : null
+    } catch (err) {
+      console.error('Week status for the system prompt failed:', err)
+      return null
+    }
+  }
+
+  private buildWeekSection(week: ReconcileOutcome | null): string | null {
+    if (!week) return null
+    const today = dayKey(new Date())
+    const past = week.planned.filter(w => w.date <= today && w.focus !== 'rest')
+    const unplanned = week.unplanned.filter(a => dayKey(new Date(a.startedAt)) <= today)
+    if (past.length === 0 && unplanned.length === 0) return null
+
+    const day = (d: string) => formatDayKey(d, { weekday: 'long', day: 'numeric' })
+    const list = (status: string) => past
+      .filter(w => w.status === status)
+      .map(w => `${w.title} (${day(w.date)}${w.completion?.durationPercent != null ? `, ${w.completion.durationPercent} % de la duración` : ''})`)
+    const done = list('done')
+    const partial = list('partial')
+    const skipped = list('skipped')
+    const pendingToday = past.filter(w => w.date === today && w.status === 'planned').map(w => w.title)
+
+    const lines = [`PLAN ESTA SEMANA (enlazado con Wahoo, del lunes a hoy):`]
+    if (done.length) lines.push(`- Hechos: ${done.join('; ')}`)
+    if (partial.length) lines.push(`- Parciales: ${partial.join('; ')}`)
+    if (skipped.length) lines.push(`- Saltados: ${skipped.join('; ')}`)
+    if (pendingToday.length) lines.push(`- Pendiente hoy: ${pendingToday.join('; ')}`)
+    if (unplanned.length) {
+      lines.push(`- Sin planificar: ${unplanned.map(a => `${a.name} (${day(dayKey(new Date(a.startedAt)))}, ${a.durationMinutes} min)`).join('; ')}`)
+    }
+    if (skipped.length) {
+      lines.push('Si el ciclista habla de la semana o de lo que le toca, comenta los saltados y ofrece replanificar con replan_week (vista previa primero).')
+    }
+    return lines.join('\n')
+  }
+
+  private buildSystemPrompt(profile: CyclistProfile | null, season: SeasonPlan | null, week: ReconcileOutcome | null = null): string {
     const today = formatDate(new Date(), { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' })
     const p = profile ?? CyclistProfile.create('')
 
@@ -103,7 +211,6 @@ export class SendMessage {
       ['Días disponibles', p.availableDays],
       ['Nivel', profile ? EXPERIENCE_LABELS[p.experience] : null],
       ['Objetivo', p.goal],
-      ['Eventos objetivo', p.targetEvents],
       ['FC máxima', p.maxHr ? `${p.maxHr} ppm` : null],
       ['FC en reposo', p.restingHr ? `${p.restingHr} ppm` : null],
       ['Lesiones / limitaciones', p.limitations],
@@ -148,6 +255,41 @@ export class SendMessage {
       )
     }
 
+    sections.push(this.buildSeasonSection(season))
+    const weekSection = this.buildWeekSection(week)
+    if (weekSection) sections.push(weekSection)
+
     return sections.join('\n\n')
+  }
+
+  // Upcoming races and current phase, so the coach knows the season context without calling a tool
+  private buildSeasonSection(season: SeasonPlan | null): string {
+    if (!season) return 'CARRERAS Y TEMPORADA: no disponible en este momento (usa get_race_events si lo necesitas).'
+    if (season.races.length === 0) {
+      return 'CARRERAS Y TEMPORADA: no hay carreras guardadas.\n' +
+        'Pregunta por sus carreras u objetivos con fecha y su prioridad (A, B o C), y guárdalas con save_race_event.'
+    }
+
+    const races = season.races.slice(0, MAX_RACES_IN_PROMPT).map(r => {
+      const when = formatDayKey(r.date, { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' })
+      const left = r.daysToRace > 0
+        ? `faltan ${r.daysToRace >= 14 ? `${Math.floor(r.daysToRace / 7)} semanas` : `${r.daysToRace} días`}`
+        : 'en curso'
+      return `- ${r.name} (${r.priority}): ${when}, ${left}`
+    })
+    if (season.races.length > MAX_RACES_IN_PROMPT) races.push(`- … y ${season.races.length - MAX_RACES_IN_PROMPT} más (get_race_events)`)
+
+    const lines = [`CARRERAS Y TEMPORADA (próximas):\n${races.join('\n')}`]
+    const phase = season.currentPhase
+    if (phase) {
+      const target = season.races.find(r => r.raceId === phase.raceId)
+      lines.push(
+        `Fase actual: ${PHASE_LABELS[phase.kind]} hasta el ${formatDayKey(phase.to, { day: 'numeric', month: 'long' })}` +
+        `${target ? ` (${phase.kind === 'recovery' ? 'tras' : 'hacia'} ${target.name})` : ''}. ${PHASE_GUIDE[phase.kind]}`
+      )
+    }
+    if (season.warnings.length) lines.push(`Avisos del plan de temporada:\n${season.warnings.map(w => `- ${w}`).join('\n')}`)
+    lines.push('Detalle semana a semana con get_season_plan.')
+    return lines.join('\n')
   }
 }

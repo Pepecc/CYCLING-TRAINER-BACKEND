@@ -1,6 +1,6 @@
 import { randomUUID } from 'crypto'
 import { addDays, dayKey } from '../training/calendar'
-import { LoadProfile } from '../training/trainingMetrics'
+import { LoadProfile, TssSource } from '../training/trainingMetrics'
 import { estimateBlocksTss, blocksDurationSeconds } from './plannedLoad'
 
 // ─── Tipos ───────────────────────────────────────────────────────────────────
@@ -17,8 +17,11 @@ export type WorkoutFocus =
 
 export type WorkoutEnvironment = 'indoor' | 'outdoor' | 'any'
 
-// planned: pendiente · done / partial / skipped: lo fija el ciclista, el coach o (en 7.9) el enlace con Wahoo
+// planned: pendiente · done / partial / skipped: lo fija el ciclista, el coach o el enlace con Wahoo
 export type PlannedStatus = 'planned' | 'done' | 'partial' | 'skipped'
+
+// auto: lo fijó el enlace con Wahoo (se recalcula) · manual: el ciclista o el coach (el enlace no lo toca)
+export type StatusSource = 'auto' | 'manual'
 
 export type PlanSource = 'coach' | 'user' | 'import'
 
@@ -53,6 +56,36 @@ export interface WorkoutBlock {
   steps: WorkoutStep[]
 }
 
+// Versión de un entreno (la original se conserva al adaptarlo)
+export interface WorkoutVersion {
+  environment: WorkoutEnvironment
+  blocks: WorkoutBlock[]
+  durationMinutes: number | null
+  plannedTss: number | null
+}
+
+// Adaptación a otro entorno o a menos minutos (7.8). Se adapta siempre desde `original`.
+export interface WorkoutAdaptation {
+  original: WorkoutVersion
+  environment: WorkoutEnvironment        // entorno pedido
+  availableMinutes: number | null        // minutos disponibles pedidos (null = sin límite)
+  changes: string[]
+  warnings: string[]
+  adaptedAt: string
+}
+
+// Enlace con los entrenos de Wahoo que lo realizan (7.9)
+export interface WorkoutCompletion {
+  wahooWorkoutIds: number[]
+  date: string                     // día en que se hizo (puede ser el anterior o el siguiente al planificado)
+  actualMinutes: number
+  actualTss: number | null
+  tssSource: TssSource | null      // de dónde sale el TSS real (el del primer entreno con carga)
+  durationPercent: number | null   // % de la duración prevista
+  tssPercent: number | null        // % del TSS previsto
+  linkedAt: string
+}
+
 // Campos que se pueden dar al crear o editar un entreno planificado
 export interface PlannedWorkoutInput {
   date?: unknown            // 'YYYY-MM-DD' en la zona horaria del ciclista
@@ -81,6 +114,10 @@ export interface PlannedWorkoutProps {
   status: PlannedStatus
   notes: string | null
   source: PlanSource
+  externalId: string | null        // id en el sistema de origen al importar (p. ej. 'trainingpeaks:3495958771')
+  adaptation: WorkoutAdaptation | null   // null = sin adaptar; si no, blocks y environment son la versión adaptada
+  statusSource: StatusSource | null      // null mientras está pendiente sin tocar
+  completion: WorkoutCompletion | null   // entrenos de Wahoo enlazados (null = ninguno)
   createdAt: string
   updatedAt: string
 }
@@ -94,10 +131,11 @@ export class PlannedWorkoutNotFoundError extends Error {
 
 const TITLE_MAX = 120
 const TEXT_MAX = 1000
+const DESCRIPTION_MAX = 4000   // las descripciones importadas de TrainingPeaks pasan de 1000
 const MAX_BLOCKS = 30
 const MAX_STEPS_PER_BLOCK = 20
 const MAX_REPEAT = 50
-const MAX_STEP_SECONDS = 6 * 3600
+const MAX_STEP_SECONDS = 10 * 3600   // una salida larga puede ir en un único paso continuo
 const MAX_TOTAL_SECONDS = 12 * 3600
 const PAST_DAYS = 366
 const FUTURE_DAYS = 731
@@ -105,7 +143,7 @@ const FUTURE_DAYS = 731
 const TARGET_RANGES: Record<Exclude<TargetType, 'open'>, [number, number, string]> = {
   hr_zone:     [1, 5,    'zona de FC entre 1 y 5'],
   power_zone:  [1, 7,    'zona de potencia entre 1 y 7'],
-  ftp_percent: [30, 300, '% de FTP entre 30 y 300'],
+  ftp_percent: [30, 500, '% de FTP entre 30 y 500'],   // sprints al 400 % en planes importados
   power_w:     [20, 2000, 'vatios entre 20 y 2000'],
   hr_bpm:      [60, 230, 'FC entre 60 y 230 ppm'],
   rpe:         [1, 10,   'RPE entre 1 y 10'],
@@ -127,6 +165,10 @@ export class PlannedWorkout implements PlannedWorkoutProps {
   status: PlannedStatus
   notes: string | null
   readonly source: PlanSource
+  readonly externalId: string | null
+  adaptation: WorkoutAdaptation | null
+  statusSource: StatusSource | null
+  completion: WorkoutCompletion | null
   readonly createdAt: string
   updatedAt: string
 
@@ -144,12 +186,22 @@ export class PlannedWorkout implements PlannedWorkoutProps {
     this.status = props.status
     this.notes = props.notes
     this.source = props.source
+    this.externalId = props.externalId ?? null
+    this.adaptation = props.adaptation ?? null
+    this.statusSource = props.statusSource ?? null
+    this.completion = props.completion ?? null
     this.createdAt = props.createdAt
     this.updatedAt = props.updatedAt
   }
 
   // Throws PlanValidationError
-  static create(userId: string, input: PlannedWorkoutInput, source: PlanSource, profile: LoadProfile | null): PlannedWorkout {
+  static create(
+    userId: string,
+    input: PlannedWorkoutInput,
+    source: PlanSource,
+    profile: LoadProfile | null,
+    externalId: string | null = null
+  ): PlannedWorkout {
     if (input.date === undefined) throw new PlanValidationError('Falta la fecha del entreno')
     if (input.title === undefined) throw new PlanValidationError('Falta el título del entreno')
     const now = new Date().toISOString()
@@ -167,6 +219,10 @@ export class PlannedWorkout implements PlannedWorkoutProps {
       status: 'planned',
       notes: null,
       source,
+      externalId,
+      adaptation: null,
+      statusSource: null,
+      completion: null,
       createdAt: now,
       updatedAt: now,
     })
@@ -182,7 +238,7 @@ export class PlannedWorkout implements PlannedWorkoutProps {
       title: input.title !== undefined ? parseTitle(input.title) : this.title,
       focus: input.focus !== undefined ? parseEnum(input.focus, WORKOUT_FOCUSES, 'Tipo de entreno') : this.focus,
       environment: input.environment !== undefined ? parseEnum(input.environment, ENVIRONMENTS, 'Entorno') : this.environment,
-      description: input.description !== undefined ? parseText(input.description, 'La descripción') : this.description,
+      description: input.description !== undefined ? parseText(input.description, 'La descripción', DESCRIPTION_MAX) : this.description,
       blocks: input.blocks !== undefined ? parseBlocks(input.blocks) : this.blocks,
       status: input.status !== undefined ? parseEnum(input.status, PLANNED_STATUSES, 'Estado') : this.status,
       notes: input.notes !== undefined ? parseText(input.notes, 'Las notas') : this.notes,
@@ -207,17 +263,106 @@ export class PlannedWorkout implements PlannedWorkoutProps {
       }
     }
 
+    // A status given by hand wins over the Wahoo link; 'planned' gives control back to the link
+    let statusSource = this.statusSource
+    if (input.status !== undefined) statusSource = next.status === 'planned' ? null : 'manual'
+    // Moving a workout to another day invalidates its automatic link (the next reconciliation redoes it)
+    let completion = this.completion
+    if (this.date !== '' && next.date !== this.date && statusSource !== 'manual') {
+      next.status = 'planned'
+      statusSource = null
+      completion = null
+    }
+
     Object.assign(this, next, {
       durationMinutes: durationMinutes === null ? null : Math.round(durationMinutes),
       plannedTss: plannedTss === null ? null : Math.round(plannedTss),
+      statusSource,
+      completion,
     })
     this.updatedAt = new Date().toISOString()
+  }
+
+  // Result of the link with Wahoo. A manual status is kept (only the link data is updated).
+  // Returns true if something changed.
+  applyLink(status: PlannedStatus, completion: WorkoutCompletion | null): boolean {
+    const manual = this.statusSource === 'manual'
+    const nextStatus = manual ? this.status : status
+    const nextSource: StatusSource | null = manual ? 'manual' : status === 'planned' ? null : 'auto'
+    if (sameCompletion(this.completion, completion) && nextStatus === this.status && nextSource === this.statusSource) return false
+    this.status = nextStatus
+    this.statusSource = nextSource
+    this.completion = completion
+    this.updatedAt = new Date().toISOString()
+    return true
   }
 
   // Re-estimates TSS after a profile change (FTP, FC) — only for structured workouts
   recalculateLoad(profile: LoadProfile | null): void {
     if (this.blocks.length > 0) this.plannedTss = estimateBlocksTss(this.blocks, profile)
+    const original = this.adaptation?.original
+    if (original && original.blocks.length > 0) original.plannedTss = estimateBlocksTss(original.blocks, profile)
   }
+
+  // The version every adaptation starts from: the original if already adapted, the current one otherwise
+  originalVersion(): WorkoutVersion {
+    return this.adaptation?.original ?? {
+      environment: this.environment,
+      blocks: this.blocks,
+      durationMinutes: this.durationMinutes,
+      plannedTss: this.plannedTss,
+    }
+  }
+
+  // Replaces the active version with the adapted one, keeping the original. Throws PlanValidationError.
+  applyAdaptation(
+    adapted: WorkoutVersion,
+    request: { environment: WorkoutEnvironment; availableMinutes: number | null },
+    notes: { changes: string[]; warnings: string[] },
+    profile: LoadProfile | null
+  ): void {
+    const original = this.originalVersion()
+    this.setVersion(adapted, profile)
+    this.adaptation = {
+      original,
+      environment: request.environment,
+      availableMinutes: request.availableMinutes,
+      changes: notes.changes,
+      warnings: notes.warnings,
+      adaptedAt: this.updatedAt,
+    }
+  }
+
+  // Back to the original version. Throws PlanValidationError if it was not adapted.
+  restoreOriginal(profile: LoadProfile | null): void {
+    const original = this.adaptation?.original
+    if (!original) throw new PlanValidationError('Este entreno no está adaptado: ya es la versión original')
+    this.adaptation = null
+    this.setVersion(original, profile)
+  }
+
+  // Replacing the content (e.g. re-importing) makes the previous adaptation meaningless
+  clearAdaptation(): void {
+    this.adaptation = null
+  }
+
+  private setVersion(v: WorkoutVersion, profile: LoadProfile | null): void {
+    this.update(
+      {
+        environment: v.environment,
+        blocks: v.blocks,
+        // Without structure the duration and TSS are the stored ones
+        ...(v.blocks.length === 0 ? { durationMinutes: v.durationMinutes, tss: v.plannedTss } : {}),
+      },
+      profile
+    )
+  }
+}
+
+function sameCompletion(a: WorkoutCompletion | null, b: WorkoutCompletion | null): boolean {
+  if (!a || !b) return a === b
+  const strip = (c: WorkoutCompletion) => JSON.stringify({ ...c, linkedAt: null })
+  return strip(a) === strip(b)
 }
 
 // ─── Validación ──────────────────────────────────────────────────────────────
@@ -308,7 +453,7 @@ function parseStep(raw: unknown, where: string): WorkoutStep {
 
   const kind = parseEnum(s.kind ?? 'steady', STEP_KINDS, `${where}: tipo de paso`)
   const durationSeconds = Math.round(
-    parseNumber(s.durationSeconds, 5, MAX_STEP_SECONDS, `${where}: la duración debe estar entre 5 segundos y 6 horas`)
+    parseNumber(s.durationSeconds, 5, MAX_STEP_SECONDS, `${where}: la duración debe estar entre 5 segundos y 10 horas`)
   )
 
   const cadenceMin = s.cadenceMin == null ? null : Math.round(parseNumber(s.cadenceMin, 30, 160, `${where}: cadencia entre 30 y 160 rpm`))

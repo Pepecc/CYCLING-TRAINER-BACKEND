@@ -54,12 +54,26 @@ export class FirestorePlannedWorkoutRepository implements PlannedWorkoutReposito
       status: w.status,
       notes: w.notes,
       source: w.source,
+      externalId: w.externalId,
+      adaptation: w.adaptation,
+      statusSource: w.statusSource,
+      completion: w.completion,
       createdAt: w.createdAt,
       updatedAt: w.updatedAt,
     }
   }
 
   private toEntity(userId: string, id: string, data: PlannedWorkoutData): PlannedWorkout {
-    return new PlannedWorkout({ ...data, id, userId })
+    // Workouts saved before 7.7 have no externalId, before 7.8 no adaptation and before 7.9 no link with Wahoo
+    // (until then every status other than 'planned' was set by hand)
+    return new PlannedWorkout({
+      ...data,
+      externalId: data.externalId ?? null,
+      adaptation: data.adaptation ?? null,
+      statusSource: data.statusSource ?? (data.status === 'planned' ? null : 'manual'),
+      completion: data.completion ?? null,
+      id,
+      userId,
+    })
   }
 }

@@ -9,9 +9,30 @@ export class OpenAIAdapter implements AIPort {
   // A week of structured workouts in one save_planned_workout call needs well over 1024 tokens
   private readonly maxTokens = Number(process.env.OPENAI_MAX_TOKENS) || 4096
 
+  // Extracting a whole plan from a photo (several weeks of structured workouts) needs a long answer
+  private readonly jsonMaxTokens = Number(process.env.OPENAI_JSON_MAX_TOKENS) || 16000
+
   constructor() {
     this.client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
     this.model = process.env.OPENAI_MODEL ?? 'gpt-4.1'
+  }
+
+  async completeJson(systemPrompt: string, messages: APIMessage[]): Promise<unknown> {
+    const response = await this.client.chat.completions.create({
+      model: this.model,
+      max_tokens: this.jsonMaxTokens,
+      response_format: { type: 'json_object' },
+      messages: [{ role: 'system', content: systemPrompt }, ...messages.map(toOpenAIMessage)],
+    })
+    const choice = response.choices[0]
+    if (choice?.finish_reason === 'length') {
+      throw new Error('La respuesta del modelo se ha cortado: la imagen tiene demasiados entrenos, prueba con menos semanas')
+    }
+    try {
+      return JSON.parse(choice?.message?.content ?? '')
+    } catch {
+      throw new Error('El modelo no ha devuelto un JSON válido')
+    }
   }
 
   async complete(
@@ -22,7 +43,7 @@ export class OpenAIAdapter implements AIPort {
   ): Promise<string> {
     const openaiMessages: OpenAI.Chat.ChatCompletionMessageParam[] = [
       { role: 'system', content: systemPrompt },
-      ...messages,
+      ...messages.map(toOpenAIMessage),
     ]
 
     // No tools — simple completion
@@ -88,5 +109,20 @@ export class OpenAIAdapter implements AIPort {
       messages: currentMessages,
     })
     return fallback.choices[0]?.message?.content ?? ''
+  }
+}
+
+// User messages with images go as content parts (text + image_url with a data URL)
+function toOpenAIMessage(m: APIMessage): OpenAI.Chat.ChatCompletionMessageParam {
+  if (m.role === 'assistant' || !m.images?.length) return { role: m.role, content: m.content }
+  return {
+    role: 'user',
+    content: [
+      ...(m.content ? [{ type: 'text' as const, text: m.content }] : []),
+      ...m.images.map(img => ({
+        type: 'image_url' as const,
+        image_url: { url: `data:${img.mediaType};base64,${img.data}`, detail: 'high' as const },
+      })),
+    ],
   }
 }

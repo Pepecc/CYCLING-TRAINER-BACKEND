@@ -31,7 +31,6 @@ export class FirestoreProfileRepository implements CyclistProfileRepository {
       maxHr: d.maxHr ?? null,
       restingHr: d.restingHr ?? null,
       availableDays: d.availableDays ?? null,
-      targetEvents: d.targetEvents ?? null,
       limitations: d.limitations ?? null,
       updatedAt: d.updatedAt ?? new Date().toISOString(),
     })

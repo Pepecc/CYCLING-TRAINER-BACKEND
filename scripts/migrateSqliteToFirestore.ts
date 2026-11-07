@@ -60,10 +60,13 @@ async function main(): Promise<void> {
       maxHr: (r.max_hr as number | null) ?? null,
       restingHr: (r.resting_hr as number | null) ?? null,
       availableDays: (r.available_days as string | null) ?? null,
-      targetEvents: (r.target_events as string | null) ?? null,
       limitations: (r.limitations as string | null) ?? null,
       updatedAt: String(r.updated_at),
     }))
+    // Free-text events stay as legacy `profile.targetEvents`; `npm run db:migrate-events` moves them to `events`
+    if (r.target_events) {
+      await db.collection('users').doc(String(r.user_id)).set({ profile: { targetEvents: r.target_events } }, { merge: true })
+    }
   }
 
   const conversationRows = rows('conversations')

@@ -6,6 +6,7 @@ import { createProfileRouter } from './routes/profile.routes'
 import { createChatRouter } from './routes/chat.routes'
 import { createWahooRouter } from './routes/wahoo.routes'
 import { createPlanRouter } from './routes/plan.routes'
+import { createEventsRouter } from './routes/events.routes'
 
 const PORT = process.env.PORT ?? 3000
 
@@ -27,7 +28,8 @@ async function bootstrap(): Promise<void> {
       callback(null, false)
     },
   }))
-  app.use(express.json())
+  // Plan files (TrainingPeaks ~1 MB per season) and chat images (up to 4 × 900 KB in base64) need more than the 100 KB default
+  app.use(express.json({ limit: process.env.JSON_BODY_LIMIT ?? '8mb' }))
 
   const container = buildContainer()
 
@@ -35,6 +37,7 @@ async function bootstrap(): Promise<void> {
   app.use('/api/chat',    createChatRouter(container))
   app.use('/api/wahoo',   createWahooRouter(container))
   app.use('/api/plan',    createPlanRouter(container))
+  app.use('/api/events',  createEventsRouter(container))
 
   app.get('/health', (_req: Request, res: Response) => {
     res.json({ status: 'ok', timestamp: new Date().toISOString() })
@@ -45,7 +48,16 @@ async function bootstrap(): Promise<void> {
   })
 
   // eslint-disable-next-line @typescript-eslint/no-unused-vars
-  app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
+  app.use((err: Error & { type?: string }, _req: Request, res: Response, _next: NextFunction) => {
+    // Errors from express.json(): body too large or malformed JSON
+    if (err.type === 'entity.too.large') {
+      res.status(413).json({ error: 'El fichero o las imágenes ocupan demasiado' })
+      return
+    }
+    if (err.type === 'entity.parse.failed') {
+      res.status(400).json({ error: 'El cuerpo de la petición no es un JSON válido' })
+      return
+    }
     console.error(err)
     res.status(500).json({ error: 'Error interno del servidor' })
   })

@@ -5,10 +5,13 @@ import { WahooWorkout } from '../../../domain/wahoo/WahooWorkout'
 import { WorkoutRepository } from '../../../domain/wahoo/WorkoutRepository'
 import { SyncWahooWorkouts } from '../../../application/wahoo/SyncWahooWorkouts'
 import { UpdateProfile } from '../../../application/profile/UpdateProfile'
-import { classifyPower, classifyHeartRate, intensityFactor, workoutTss, TssSource } from '../../../domain/training/trainingMetrics'
+import { classifyPower, classifyHeartRate, intensityFactor, workoutTss } from '../../../domain/training/trainingMetrics'
+import { Fitness, interpretTsb, stepFitness } from '../../../domain/training/fitness'
 import { dayKey, addDays, mondayKey, formatDayKey, formatDate } from '../../../domain/training/calendar'
 import { PlanValidationError, PlannedWorkoutNotFoundError } from '../../../domain/planning/PlannedWorkout'
-import { PlanningTools, PLANNING_TOOLS } from './PlanningTools'
+import { PlanningTools, PLANNING_TOOLS, TSS_SOURCE_LABELS } from './PlanningTools'
+import { SeasonTools, SEASON_TOOLS } from './SeasonTools'
+import { RaceValidationError, RaceEventNotFoundError } from '../../../domain/events/RaceEvent'
 
 interface WeekBucket {
   weekStart: string
@@ -33,12 +36,6 @@ interface SeasonKpis {
 // CTL/ATL need history before the period being reported, otherwise they start at 0
 const CTL_WARMUP_DAYS = 90
 
-const TSS_SOURCE_LABELS: Record<TssSource, string> = {
-  power: 'potencia (Wahoo)',
-  power_estimated: 'estimado con NP y FTP',
-  hr: 'hrTSS (FC media)',
-}
-
 // update_profile argument (snake_case, as the model sees it) → profile field
 const PROFILE_ARG_MAP: Record<string, keyof CyclistProfileFields> = {
   ftp: 'ftp',
@@ -49,7 +46,6 @@ const PROFILE_ARG_MAP: Record<string, keyof CyclistProfileFields> = {
   max_hr: 'maxHr',
   resting_hr: 'restingHr',
   available_days: 'availableDays',
-  target_events: 'targetEvents',
   limitations: 'limitations',
 }
 
@@ -59,7 +55,8 @@ export class ToolExecutor {
     private readonly workoutRepository: WorkoutRepository,
     private readonly profileRepository: CyclistProfileRepository,
     private readonly updateProfileUseCase: UpdateProfile,
-    private readonly planningTools: PlanningTools
+    private readonly planningTools: PlanningTools,
+    private readonly seasonTools: SeasonTools
   ) {}
 
   // Never throws: errors are returned to the model as a tool result so the coach can answer normally
@@ -78,7 +75,16 @@ export class ToolExecutor {
         case 'save_planned_workout':
         case 'update_planned_workout':
         case 'delete_planned_workout':
+        case 'adapt_planned_workout':
+        case 'replan_week':
+        case 'get_form_projection':
           return await this.planningTools.execute(userId, toolName, args)
+        case 'get_race_events':
+        case 'save_race_event':
+        case 'update_race_event':
+        case 'delete_race_event':
+        case 'get_season_plan':
+          return await this.seasonTools.execute(userId, toolName, args)
         default:
           return JSON.stringify({ error: `Tool desconocida: ${toolName}` })
       }
@@ -88,6 +94,12 @@ export class ToolExecutor {
       }
       if (err instanceof PlanValidationError) {
         return JSON.stringify({ error: 'dato_no_valido', mensaje: `${err.message}. No se ha guardado nada; corrige el dato y vuelve a intentarlo.` })
+      }
+      if (err instanceof RaceValidationError) {
+        return JSON.stringify({ error: 'dato_no_valido', mensaje: `${err.message}. No se ha guardado nada; corrige el dato y vuelve a intentarlo.` })
+      }
+      if (err instanceof RaceEventNotFoundError) {
+        return JSON.stringify({ error: 'no_encontrado', mensaje: 'No existe una carrera con ese id. Consulta las carreras con get_race_events.' })
       }
       if (err instanceof PlannedWorkoutNotFoundError) {
         return JSON.stringify({ error: 'no_encontrado', mensaje: 'No existe un entreno planificado con ese id. Consulta el plan con get_training_plan.' })
@@ -101,6 +113,9 @@ export class ToolExecutor {
       console.error(`Tool ${toolName} failed:`, err)
       if (toolName === 'update_profile') {
         return JSON.stringify({ error: 'error_guardando', mensaje: 'No se ha podido guardar el perfil. Inténtalo más tarde.' })
+      }
+      if (SEASON_TOOLS.includes(toolName)) {
+        return JSON.stringify({ error: 'carreras_no_disponible', mensaje: 'No se ha podido acceder a las carreras en este momento. Inténtalo más tarde.' })
       }
       if (PLANNING_TOOLS.includes(toolName)) {
         return JSON.stringify({ error: 'plan_no_disponible', mensaje: 'No se ha podido acceder al plan de entrenamiento en este momento. Inténtalo más tarde.' })
@@ -261,11 +276,6 @@ export class ToolExecutor {
     ])
     const ftp = profile?.ftp ?? null
 
-    // CTL = 42-day exponential weighted average of TSS
-    // ATL = 7-day exponential weighted average of TSS
-    const ctlDecay = 1 - Math.exp(-1 / 42)
-    const atlDecay = 1 - Math.exp(-1 / 7)
-
     // Daily TSS map (local day)
     const dailyTss = new Map<string, number>()
     let workoutsWithoutTss = 0
@@ -286,8 +296,7 @@ export class ToolExecutor {
       }
     })
 
-    let ctl = 0
-    let atl = 0
+    let fitness: Fitness = { ctl: 0, atl: 0 }
     let peakCtl = 0
     let peakCtlKey: string | null = null
     let totalTss = 0
@@ -296,18 +305,18 @@ export class ToolExecutor {
     for (let key = warmupStartKey; key <= todayKey; key = addDays(key, 1)) {
       const tss = dailyTss.get(key) ?? 0
 
-      ctl = ctl + ctlDecay * (tss - ctl)
-      atl = atl + atlDecay * (tss - atl)
+      fitness = stepFitness(fitness, tss)
 
       if (key >= seasonStartKey) {
         totalTss += tss
-        if (ctl > peakCtl) {
-          peakCtl = ctl
+        if (fitness.ctl > peakCtl) {
+          peakCtl = fitness.ctl
           peakCtlKey = key
         }
       }
     }
 
+    const { ctl, atl } = fitness
     const tsb = ctl - atl
     const totalHours = seasonWorkouts.reduce((acc, w) => acc + w.durationMinutes / 60, 0)
 
@@ -324,7 +333,7 @@ export class ToolExecutor {
 
     return JSON.stringify({
       kpis,
-      interpretacion_tsb: this.interpretTsb(tsb),
+      interpretacion_tsb: interpretTsb(tsb),
       calidad_datos: {
         entrenos_sin_tss: workoutsWithoutTss,
         entrenos_con_tss_estimado: workoutsWithEstimatedTss,
@@ -363,7 +372,6 @@ export class ToolExecutor {
         fc_max: profile.maxHr,
         fc_reposo: profile.restingHr,
         dias_disponibles: profile.availableDays,
-        eventos_objetivo: profile.targetEvents,
         limitaciones: profile.limitations,
       },
     })
@@ -377,14 +385,6 @@ export class ToolExecutor {
     return this.workoutRepository.findSince(userId, since)
   }
 
-  private interpretTsb(tsb: number): string {
-    if (tsb > 25)  return 'Forma pico — fresco y listo para competir'
-    if (tsb > 10)  return 'Buena forma — descansado, buen momento para esfuerzos duros'
-    if (tsb > -10) return 'En forma estable — equilibrio carga/recuperación'
-    if (tsb > -20) return 'En carga — algo de fatiga acumulada, normal en bloque de trabajo'
-    if (tsb > -30) return 'Carga alta — monitorizar recuperación, evitar esfuerzos máximos'
-    return 'Sobreentrenamiento — recuperación urgente necesaria'
-  }
 }
 
 function positiveInt(value: unknown, fallback: number): number {

@@ -26,6 +26,24 @@ import { SavePlannedWorkouts } from '../application/planning/SavePlannedWorkouts
 import { UpdatePlannedWorkout } from '../application/planning/UpdatePlannedWorkout'
 import { DeletePlannedWorkout } from '../application/planning/DeletePlannedWorkout'
 import { GetTrainingPlan } from '../application/planning/GetTrainingPlan'
+import { AdaptPlannedWorkout } from '../application/planning/AdaptPlannedWorkout'
+import { ReconcilePlan } from '../application/planning/ReconcilePlan'
+import { ReplanWeek } from '../application/planning/ReplanWeek'
+import { GetFormProjection } from '../application/planning/GetFormProjection'
+import { FirestoreRaceEventRepository } from '../infrastructure/persistence/firestore/FirestoreRaceEventRepository'
+import { SeasonTools } from '../infrastructure/ai/tools/SeasonTools'
+import { SaveRaceEvents } from '../application/events/SaveRaceEvents'
+import { UpdateRaceEvent } from '../application/events/UpdateRaceEvent'
+import { DeleteRaceEvent } from '../application/events/DeleteRaceEvent'
+import { GetRaceEvents } from '../application/events/GetRaceEvents'
+import { GetSeasonPlan } from '../application/events/GetSeasonPlan'
+import { PreviewPlanImport } from '../application/planning/PreviewPlanImport'
+import { ImportPlannedWorkouts } from '../application/planning/ImportPlannedWorkouts'
+import { ExtractPlanFromImage } from '../application/planning/ExtractPlanFromImage'
+import { TrainingPeaksParser } from '../infrastructure/import/TrainingPeaksParser'
+import { NativePlanParser } from '../infrastructure/import/NativePlanParser'
+import { AIPlanImageExtractor } from '../infrastructure/ai/AIPlanImageExtractor'
+import { ConversationRepository } from '../domain/chat/ConversationRepository'
 
 export interface Container {
   updateProfile:       UpdateProfile
@@ -43,6 +61,19 @@ export interface Container {
   updatePlannedWorkout: UpdatePlannedWorkout
   deletePlannedWorkout: DeletePlannedWorkout
   getTrainingPlan:     GetTrainingPlan
+  adaptPlannedWorkout: AdaptPlannedWorkout
+  reconcilePlan:       ReconcilePlan
+  replanWeek:          ReplanWeek
+  getFormProjection:   GetFormProjection
+  saveRaceEvents:      SaveRaceEvents
+  updateRaceEvent:     UpdateRaceEvent
+  deleteRaceEvent:     DeleteRaceEvent
+  getRaceEvents:       GetRaceEvents
+  getSeasonPlan:       GetSeasonPlan
+  previewPlanImport:   PreviewPlanImport
+  importPlannedWorkouts: ImportPlannedWorkouts
+  extractPlanFromImage: ExtractPlanFromImage
+  conversationRepository: ConversationRepository
 }
 
 export function buildContainer(): Container {
@@ -57,6 +88,7 @@ export function buildContainer(): Container {
   const oauthStateRepository   = new FirestoreOAuthStateRepository(db)
   const workoutRepository      = new FirestoreWorkoutRepository(db)
   const plannedWorkoutRepository = new FirestorePlannedWorkoutRepository(db)
+  const raceEventRepository    = new FirestoreRaceEventRepository(db)
 
   // --- Configure Firebase auth middleware ---
   configureAuth(userRepository)
@@ -72,9 +104,27 @@ export function buildContainer(): Container {
   const updatePlannedWorkout = new UpdatePlannedWorkout(plannedWorkoutRepository, profileRepository)
   const deletePlannedWorkout = new DeletePlannedWorkout(plannedWorkoutRepository)
   const getTrainingPlan      = new GetTrainingPlan(plannedWorkoutRepository, profileRepository)
-  const planningTools = new PlanningTools(savePlannedWorkouts, updatePlannedWorkout, deletePlannedWorkout, getTrainingPlan, profileRepository)
-  const toolExecutor  = new ToolExecutor(syncWorkouts, workoutRepository, profileRepository, updateProfile, planningTools)
-  const sendMessage   = new SendMessage(conversationRepository, profileRepository, aiPort, toolExecutor)
+  const adaptPlannedWorkout  = new AdaptPlannedWorkout(plannedWorkoutRepository, profileRepository)
+  const saveRaceEvents  = new SaveRaceEvents(raceEventRepository)
+  const updateRaceEvent = new UpdateRaceEvent(raceEventRepository)
+  const deleteRaceEvent = new DeleteRaceEvent(raceEventRepository)
+  const getRaceEvents   = new GetRaceEvents(raceEventRepository)
+  const getSeasonPlan   = new GetSeasonPlan(raceEventRepository)
+  const reconcilePlan   = new ReconcilePlan(syncWorkouts, workoutRepository, plannedWorkoutRepository, profileRepository)
+  const replanWeek      = new ReplanWeek(plannedWorkoutRepository, profileRepository, reconcilePlan, getSeasonPlan)
+  const getFormProjection = new GetFormProjection(workoutRepository, plannedWorkoutRepository, profileRepository, reconcilePlan, getSeasonPlan)
+  const planningTools = new PlanningTools(
+    savePlannedWorkouts, updatePlannedWorkout, deletePlannedWorkout, getTrainingPlan, profileRepository, adaptPlannedWorkout,
+    reconcilePlan, replanWeek, getFormProjection
+  )
+  const seasonTools   = new SeasonTools(saveRaceEvents, updateRaceEvent, deleteRaceEvent, getRaceEvents, getSeasonPlan)
+  const toolExecutor  = new ToolExecutor(syncWorkouts, workoutRepository, profileRepository, updateProfile, planningTools, seasonTools)
+  const sendMessage   = new SendMessage(conversationRepository, profileRepository, aiPort, toolExecutor, getSeasonPlan, reconcilePlan)
+  const previewPlanImport = new PreviewPlanImport(
+    [new TrainingPeaksParser(), new NativePlanParser()], plannedWorkoutRepository, profileRepository
+  )
+  const importPlannedWorkouts = new ImportPlannedWorkouts(plannedWorkoutRepository, profileRepository)
+  const extractPlanFromImage  = new ExtractPlanFromImage(new AIPlanImageExtractor(aiPort), previewPlanImport, profileRepository)
 
   return {
     updateProfile,
@@ -92,5 +142,18 @@ export function buildContainer(): Container {
     updatePlannedWorkout,
     deletePlannedWorkout,
     getTrainingPlan,
+    adaptPlannedWorkout,
+    reconcilePlan,
+    replanWeek,
+    getFormProjection,
+    saveRaceEvents,
+    updateRaceEvent,
+    deleteRaceEvent,
+    getRaceEvents,
+    getSeasonPlan,
+    previewPlanImport,
+    importPlannedWorkouts,
+    extractPlanFromImage,
+    conversationRepository,
   }
 }

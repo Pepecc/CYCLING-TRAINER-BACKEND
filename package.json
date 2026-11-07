@@ -7,7 +7,9 @@
     "build": "tsc",
     "start": "node dist/infrastructure/http/server.js",
     "emulators": "node scripts/emulators.js",
-    "db:migrate": "ts-node scripts/migrateSqliteToFirestore.ts"
+    "db:migrate": "ts-node scripts/migrateSqliteToFirestore.ts",
+    "db:migrate-events": "ts-node scripts/migrateProfileEvents.ts",
+    "plan:import": "ts-node scripts/importPlan.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.91.1",

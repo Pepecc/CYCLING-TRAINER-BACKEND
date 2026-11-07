@@ -19,6 +19,11 @@ export function addDays(key: string, days: number): string {
   return d.toISOString().slice(0, 10)
 }
 
+// Días de `from` a `to` (claves 'YYYY-MM-DD'); negativo si `to` es anterior
+export function daysBetween(from: string, to: string): number {
+  return Math.round((Date.parse(`${to}T12:00:00Z`) - Date.parse(`${from}T12:00:00Z`)) / 86_400_000)
+}
+
 // Lunes de la semana de una clave 'YYYY-MM-DD'
 export function mondayKey(key: string): string {
   const dow = new Date(`${key}T12:00:00Z`).getUTCDay()  // 0 = domingo

@@ -1,8 +1,8 @@
 import { Firestore } from 'firebase-admin/firestore'
 import { Conversation } from '../../../domain/chat/Conversation'
-import { Message, MessageRole } from '../../../domain/chat/Message'
-import { ConversationRepository } from '../../../domain/chat/ConversationRepository'
-import { conversationsCol, messagesCol } from './paths'
+import { Message, MessageAttachment, MessageRole } from '../../../domain/chat/Message'
+import { ConversationRepository, StoredAttachment } from '../../../domain/chat/ConversationRepository'
+import { attachmentsCol, conversationsCol, messagesCol } from './paths'
 
 interface ConversationData {
   title: string
@@ -12,6 +12,15 @@ interface ConversationData {
 interface MessageData {
   role: MessageRole
   content: string
+  createdAt: string
+  attachments?: MessageAttachment[]
+}
+
+interface AttachmentData {
+  mediaType: string
+  name: string | null
+  sizeBytes: number
+  data: Buffer          // stored as Firestore bytes (base64 would take a third more of the 1 MiB limit)
   createdAt: string
 }
 
@@ -28,7 +37,9 @@ export class FirestoreConversationRepository implements ConversationRepository {
     const conversation = this.toEntity(userId, id, snap.data() as ConversationData)
     conversation.messages = messages.docs.map(m => {
       const d = m.data() as MessageData
-      return new Message({ id: m.id, conversationId: id, role: d.role, content: d.content, createdAt: d.createdAt })
+      return new Message({
+        id: m.id, conversationId: id, role: d.role, content: d.content, createdAt: d.createdAt, attachments: d.attachments,
+      })
     })
     return conversation
   }
@@ -45,7 +56,26 @@ export class FirestoreConversationRepository implements ConversationRepository {
 
   async saveMessage(userId: string, message: Message): Promise<void> {
     const data: MessageData = { role: message.role, content: message.content, createdAt: message.createdAt }
+    if (message.attachments.length) data.attachments = message.attachments
     await messagesCol(this.db, userId, message.conversationId).doc(message.id).set(data)
+  }
+
+  async saveAttachment(userId: string, conversationId: string, a: StoredAttachment): Promise<void> {
+    const data: AttachmentData = {
+      mediaType: a.mediaType,
+      name: a.name,
+      sizeBytes: a.sizeBytes,
+      data: Buffer.from(a.data, 'base64'),
+      createdAt: new Date().toISOString(),
+    }
+    await attachmentsCol(this.db, userId, conversationId).doc(a.id).set(data)
+  }
+
+  async findAttachment(userId: string, conversationId: string, id: string): Promise<StoredAttachment | null> {
+    const snap = await attachmentsCol(this.db, userId, conversationId).doc(id).get()
+    if (!snap.exists) return null
+    const d = snap.data() as AttachmentData
+    return { id, mediaType: d.mediaType, name: d.name, sizeBytes: d.sizeBytes, data: Buffer.from(d.data).toString('base64') }
   }
 
   private toEntity(userId: string, id: string, data: ConversationData): Conversation {
