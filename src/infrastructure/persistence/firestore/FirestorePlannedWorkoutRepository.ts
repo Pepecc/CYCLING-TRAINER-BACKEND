@@ -58,6 +58,7 @@ export class FirestorePlannedWorkoutRepository implements PlannedWorkoutReposito
       adaptation: w.adaptation,
       statusSource: w.statusSource,
       completion: w.completion,
+      testProtocol: w.testProtocol,
       createdAt: w.createdAt,
       updatedAt: w.updatedAt,
     }
@@ -72,6 +73,7 @@ export class FirestorePlannedWorkoutRepository implements PlannedWorkoutReposito
       adaptation: data.adaptation ?? null,
       statusSource: data.statusSource ?? (data.status === 'planned' ? null : 'manual'),
       completion: data.completion ?? null,
+      testProtocol: data.testProtocol ?? null,
       id,
       userId,
     })

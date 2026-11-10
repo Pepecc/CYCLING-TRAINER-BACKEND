@@ -12,6 +12,9 @@ import { PlanValidationError, PlannedWorkoutNotFoundError } from '../../../domai
 import { PlanningTools, PLANNING_TOOLS, TSS_SOURCE_LABELS } from './PlanningTools'
 import { SeasonTools, SEASON_TOOLS } from './SeasonTools'
 import { RaceValidationError, RaceEventNotFoundError } from '../../../domain/events/RaceEvent'
+import { ProgressTools, PROGRESS_TOOLS } from './ProgressTools'
+import { CheckInValidationError, CheckInNotFoundError } from '../../../domain/wellness/DailyCheckIn'
+import { FitnessTestError } from '../../../domain/testing/fitnessTest'
 
 interface WeekBucket {
   weekStart: string
@@ -56,7 +59,8 @@ export class ToolExecutor {
     private readonly profileRepository: CyclistProfileRepository,
     private readonly updateProfileUseCase: UpdateProfile,
     private readonly planningTools: PlanningTools,
-    private readonly seasonTools: SeasonTools
+    private readonly seasonTools: SeasonTools,
+    private readonly progressTools: ProgressTools
   ) {}
 
   // Never throws: errors are returned to the model as a tool result so the coach can answer normally
@@ -85,6 +89,13 @@ export class ToolExecutor {
         case 'delete_race_event':
         case 'get_season_plan':
           return await this.seasonTools.execute(userId, toolName, args)
+        case 'save_daily_checkin':
+        case 'get_checkins':
+        case 'get_fitness_tests':
+        case 'schedule_fitness_test':
+        case 'record_fitness_test':
+        case 'get_weekly_summary':
+          return await this.progressTools.execute(userId, toolName, args)
         default:
           return JSON.stringify({ error: `Tool desconocida: ${toolName}` })
       }
@@ -97,6 +108,12 @@ export class ToolExecutor {
       }
       if (err instanceof RaceValidationError) {
         return JSON.stringify({ error: 'dato_no_valido', mensaje: `${err.message}. No se ha guardado nada; corrige el dato y vuelve a intentarlo.` })
+      }
+      if (err instanceof CheckInValidationError || err instanceof FitnessTestError) {
+        return JSON.stringify({ error: 'dato_no_valido', mensaje: `${err.message}. No se ha guardado nada; corrige el dato y vuelve a intentarlo.` })
+      }
+      if (err instanceof CheckInNotFoundError) {
+        return JSON.stringify({ error: 'no_encontrado', mensaje: err.message })
       }
       if (err instanceof RaceEventNotFoundError) {
         return JSON.stringify({ error: 'no_encontrado', mensaje: 'No existe una carrera con ese id. Consulta las carreras con get_race_events.' })
@@ -116,6 +133,9 @@ export class ToolExecutor {
       }
       if (SEASON_TOOLS.includes(toolName)) {
         return JSON.stringify({ error: 'carreras_no_disponible', mensaje: 'No se ha podido acceder a las carreras en este momento. Inténtalo más tarde.' })
+      }
+      if (PROGRESS_TOOLS.includes(toolName)) {
+        return JSON.stringify({ error: 'no_disponible', mensaje: 'No se ha podido acceder a los check-ins, los tests o el resumen en este momento. Inténtalo más tarde.' })
       }
       if (PLANNING_TOOLS.includes(toolName)) {
         return JSON.stringify({ error: 'plan_no_disponible', mensaje: 'No se ha podido acceder al plan de entrenamiento en este momento. Inténtalo más tarde.' })

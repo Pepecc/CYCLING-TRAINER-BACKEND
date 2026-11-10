@@ -2,6 +2,7 @@ import { randomUUID } from 'crypto'
 import { addDays, dayKey } from '../training/calendar'
 import { LoadProfile, TssSource } from '../training/trainingMetrics'
 import { estimateBlocksTss, blocksDurationSeconds } from './plannedLoad'
+import type { TestProtocol } from '../testing/fitnessTest'
 
 // ─── Tipos ───────────────────────────────────────────────────────────────────
 
@@ -118,6 +119,7 @@ export interface PlannedWorkoutProps {
   adaptation: WorkoutAdaptation | null   // null = sin adaptar; si no, blocks y environment son la versión adaptada
   statusSource: StatusSource | null      // null mientras está pendiente sin tocar
   completion: WorkoutCompletion | null   // entrenos de Wahoo enlazados (null = ninguno)
+  testProtocol: TestProtocol | null      // protocolo si es un test (focus 'test') programado (7.11)
   createdAt: string
   updatedAt: string
 }
@@ -169,6 +171,7 @@ export class PlannedWorkout implements PlannedWorkoutProps {
   adaptation: WorkoutAdaptation | null
   statusSource: StatusSource | null
   completion: WorkoutCompletion | null
+  testProtocol: TestProtocol | null
   readonly createdAt: string
   updatedAt: string
 
@@ -190,6 +193,7 @@ export class PlannedWorkout implements PlannedWorkoutProps {
     this.adaptation = props.adaptation ?? null
     this.statusSource = props.statusSource ?? null
     this.completion = props.completion ?? null
+    this.testProtocol = props.testProtocol ?? null
     this.createdAt = props.createdAt
     this.updatedAt = props.updatedAt
   }
@@ -223,6 +227,7 @@ export class PlannedWorkout implements PlannedWorkoutProps {
       adaptation: null,
       statusSource: null,
       completion: null,
+      testProtocol: null,
       createdAt: now,
       updatedAt: now,
     })
@@ -279,7 +284,16 @@ export class PlannedWorkout implements PlannedWorkoutProps {
       plannedTss: plannedTss === null ? null : Math.round(plannedTss),
       statusSource,
       completion,
+      // A test protocol only makes sense while the session is still a test
+      testProtocol: next.focus === 'test' ? this.testProtocol : null,
     })
+    this.updatedAt = new Date().toISOString()
+  }
+
+  // Marks the session as a scheduled fitness test (its result updates the profile). Throws PlanValidationError.
+  setTestProtocol(protocol: TestProtocol | null): void {
+    if (protocol && this.focus !== 'test') throw new PlanValidationError('Solo un entreno de tipo test puede llevar protocolo de test')
+    this.testProtocol = protocol
     this.updatedAt = new Date().toISOString()
   }
 

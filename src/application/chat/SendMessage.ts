@@ -16,6 +16,9 @@ import { GetSeasonPlan } from '../events/GetSeasonPlan'
 import { PHASE_GUIDE, PHASE_LABELS } from '../../infrastructure/ai/tools/SeasonTools'
 import { ReconcilePlan, ReconcileOutcome } from '../planning/ReconcilePlan'
 import { dayKey, mondayKey } from '../../domain/training/calendar'
+import { GetDailyCheckIns, CheckInWithReadiness } from '../wellness/GetDailyCheckIns'
+import { READINESS_GUIDE } from '../../domain/wellness/DailyCheckIn'
+import { READINESS_LABELS } from '../../infrastructure/ai/tools/ProgressTools'
 
 const MAX_RACES_IN_PROMPT = 8
 const CONTEXT_MESSAGES = 20
@@ -55,7 +58,8 @@ export class SendMessage {
     private readonly aiPort: AIPort,
     private readonly toolExecutor: ToolExecutor | null = null,
     private readonly getSeasonPlan: GetSeasonPlan | null = null,
-    private readonly reconcilePlan: ReconcilePlan | null = null
+    private readonly reconcilePlan: ReconcilePlan | null = null,
+    private readonly getCheckIns: GetDailyCheckIns | null = null
   ) {}
 
   async execute({ userId, content: rawContent, conversationId, images: rawImages }: SendMessageInput): Promise<SendMessageOutput> {
@@ -74,12 +78,13 @@ export class SendMessage {
       await this.conversationRepository.save(conversation)
     }
 
-    const [profile, season, week] = await Promise.all([
+    const [profile, season, week, checkIn] = await Promise.all([
       this.profileRepository.findByUserId(userId),
       this.loadSeason(userId),
       this.loadWeek(userId),
+      this.loadCheckIn(userId),
     ])
-    const systemPrompt = this.buildSystemPrompt(profile, season, week)
+    const systemPrompt = this.buildSystemPrompt(profile, season, week, checkIn)
 
     // Persist the images (one document each), then the user message that references them
     const attachments = await this.saveImages(userId, conversation.id, images)
@@ -169,6 +174,45 @@ export class SendMessage {
     }
   }
 
+  private async loadCheckIn(userId: string): Promise<CheckInWithReadiness | null | undefined> {
+    if (!this.getCheckIns) return undefined
+    try {
+      return await this.getCheckIns.today(userId)
+    } catch (err) {
+      console.error('Check-in for the system prompt failed:', err)
+      return undefined
+    }
+  }
+
+  // Today's check-in and readiness (undefined = not available: the section is left out)
+  private buildCheckInSection(checkIn: CheckInWithReadiness | null | undefined): string | null {
+    const isMonday = new Date(`${dayKey(new Date())}T12:00:00Z`).getUTCDay() === 1
+    const monday = isMonday ? '\nHoy es lunes: si no lo habéis visto, ofrece el resumen de la semana pasada (get_weekly_summary).' : ''
+    if (checkIn === undefined) return monday ? monday.trim() : null
+    if (checkIn === null) {
+      return 'CHECK-IN DE HOY: sin hacer. Si te cuenta cómo ha dormido o cómo se encuentra, guárdalo con save_daily_checkin.' + monday
+    }
+    const c = checkIn.checkIn
+    const r = checkIn.readiness
+    const parts = [
+      c.fatigue !== null ? `cansancio ${c.fatigue}/5` : null,
+      c.sleepHours !== null ? `${c.sleepHours} h de sueño` : null,
+      c.sleepQuality !== null ? `calidad del sueño ${c.sleepQuality}/5` : null,
+      c.feeling !== null ? `sensaciones ${c.feeling}/5` : null,
+      c.soreness !== null ? `dolor muscular ${c.soreness}/5` : null,
+      c.morningHr !== null ? `FC al despertar ${c.morningHr} ppm` : null,
+      c.notes ? `notas: "${c.notes}"` : null,
+    ].filter(Boolean)
+    const lines = [
+      `CHECK-IN DE HOY: ${parts.join(', ')}.`,
+      `Disponibilidad: ${READINESS_LABELS[r.level]}${r.reasons.length ? ` (${r.reasons.join('; ')})` : ''}. ${READINESS_GUIDE[r.level]}`,
+    ]
+    if (r.level === 'caution' || r.level === 'rest') {
+      lines.push('Si hoy tiene una sesión de calidad, coméntalo y propón adaptarla (adapt_planned_workout con menos minutos) o cambiarla por resistencia suave o descanso; no cambies nada sin su conformidad.')
+    }
+    return lines.join('\n') + monday
+  }
+
   private buildWeekSection(week: ReconcileOutcome | null): string | null {
     if (!week) return null
     const today = dayKey(new Date())
@@ -199,7 +243,12 @@ export class SendMessage {
     return lines.join('\n')
   }
 
-  private buildSystemPrompt(profile: CyclistProfile | null, season: SeasonPlan | null, week: ReconcileOutcome | null = null): string {
+  private buildSystemPrompt(
+    profile: CyclistProfile | null,
+    season: SeasonPlan | null,
+    week: ReconcileOutcome | null = null,
+    checkIn: CheckInWithReadiness | null | undefined = undefined
+  ): string {
     const today = formatDate(new Date(), { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' })
     const p = profile ?? CyclistProfile.create('')
 
@@ -258,6 +307,8 @@ export class SendMessage {
     sections.push(this.buildSeasonSection(season))
     const weekSection = this.buildWeekSection(week)
     if (weekSection) sections.push(weekSection)
+    const checkInSection = this.buildCheckInSection(checkIn)
+    if (checkInSection) sections.push(checkInSection)
 
     return sections.join('\n\n')
   }

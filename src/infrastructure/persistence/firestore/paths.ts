@@ -8,7 +8,9 @@ import { Firestore, CollectionReference, DocumentReference } from 'firebase-admi
 //   users/{uid}/workouts/{wahooId}               WahooWorkout + { startedAtUtc, syncedAt }
 //   users/{uid}/plannedWorkouts/{id}             PlannedWorkout (sin id ni userId), `date` = 'YYYY-MM-DD', `externalId` al importar
 //   users/{uid}/events/{id}                      RaceEvent (sin id ni userId), `date` = 'YYYY-MM-DD'
-//   users/{uid}/private/wahoo                    Wahoo OAuth tokens (encrypted)
+//   users/{uid}/checkIns/{date}                  DailyCheckIn (sin userId), id = 'YYYY-MM-DD'
+//   users/{uid}/fitnessTests/{id}                FitnessTestResult (sin id ni userId), `date` = 'YYYY-MM-DD'
+//   users/{uid}/private/wahoo                  Wahoo OAuth tokens (encrypted)
 //   users/{uid}/private/workoutSync              { lastSyncedAt }
 //   oauthStates/{state}                          { userId, expiresAt } — TTL policy on expiresAt
 
@@ -32,6 +34,12 @@ export const plannedWorkoutsCol = (db: Firestore, uid: string): CollectionRefere
 
 export const eventsCol = (db: Firestore, uid: string): CollectionReference =>
   userDoc(db, uid).collection('events')
+
+export const checkInsCol = (db: Firestore, uid: string): CollectionReference =>
+  userDoc(db, uid).collection('checkIns')
+
+export const fitnessTestsCol = (db: Firestore, uid: string): CollectionReference =>
+  userDoc(db, uid).collection('fitnessTests')
 
 export const privateDoc = (db: Firestore, uid: string, name: 'wahoo' | 'workoutSync'): DocumentReference =>
   userDoc(db, uid).collection('private').doc(name)

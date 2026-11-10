@@ -316,6 +316,7 @@ export class PlanningTools {
     }
     if (w.notes) entry.notas = w.notes
     if (w.source === 'import') entry.origen = 'import'
+    if (w.testProtocol) entry.protocolo_test = w.testProtocol   // its result goes through record_fitness_test
     if (w.status !== 'planned') entry.estado_fijado = w.statusSource === 'auto' ? 'wahoo' : 'a mano'
     const c = w.completion
     if (c) {

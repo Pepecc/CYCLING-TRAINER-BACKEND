@@ -18,8 +18,13 @@ import { ReplanWeek } from '../../../application/planning/ReplanWeek'
 import { GetFormProjection } from '../../../application/planning/GetFormProjection'
 import { WahooWorkout } from '../../../domain/wahoo/WahooWorkout'
 import { addDays, dayKey } from '../../../domain/training/calendar'
+import { GetWeeklySummary } from '../../../application/planning/GetWeeklySummary'
+import { ExportPlannedWorkout } from '../../../application/planning/ExportPlannedWorkout'
+import { ExportError } from '../../../domain/planning/workoutExport'
 
 interface PlanContainer {
+  getWeeklySummary: GetWeeklySummary
+  exportPlannedWorkout: ExportPlannedWorkout
   adaptPlannedWorkout: AdaptPlannedWorkout
   savePlannedWorkouts: SavePlannedWorkouts
   updatePlannedWorkout: UpdatePlannedWorkout
@@ -54,7 +59,7 @@ function pickInput(body: unknown): PlannedWorkoutInput {
 function sendError(res: Response, err: unknown): void {
   if (err instanceof AdaptationNotPossibleError) {
     res.status(422).json({ error: err.message, minimumMinutes: err.minimumMinutes })
-  } else if (err instanceof PlanValidationError || err instanceof ImportFormatError || err instanceof ImageValidationError) {
+  } else if (err instanceof PlanValidationError || err instanceof ImportFormatError || err instanceof ImageValidationError || err instanceof ExportError) {
     res.status(400).json({ error: err.message })
   } else if (err instanceof PlannedWorkoutNotFoundError) {
     res.status(404).json({ error: err.message })
@@ -99,6 +104,33 @@ export function createPlanRouter(c: PlanContainer): Router {
       const { userId } = req as unknown as AuthRequest
       const to = typeof req.query.to === 'string' ? req.query.to : null
       res.json(await c.getFormProjection.execute(userId, to))
+    } catch (err) {
+      sendError(res, err)
+    }
+  })
+
+  // GET /api/plan/weekly-summary?week=YYYY-MM-DD — planned vs done and a recommendation (default: this week)
+  router.get('/weekly-summary', async (req, res: Response) => {
+    try {
+      const { userId } = req as unknown as AuthRequest
+      const week = typeof req.query.week === 'string' ? req.query.week : null
+      res.json(await c.getWeeklySummary.execute(userId, week))
+    } catch (err) {
+      sendError(res, err)
+    }
+  })
+
+  // GET /api/plan/:id/export?format=fit|zwo — structured workout file (ELEMNT / Garmin: .fit; Zwift and others: .zwo)
+  router.get('/:id/export', async (req: Request<{ id: string }>, res: Response) => {
+    try {
+      const { userId } = req as unknown as AuthRequest
+      const file = await c.exportPlannedWorkout.execute(userId, req.params.id, req.query.format ?? 'fit')
+      res.setHeader('Content-Type', file.contentType)
+      res.setHeader('Content-Disposition', `attachment; filename="${file.filename}"`)
+      // Warnings for the interface, URI-encoded JSON (headers are ASCII)
+      res.setHeader('X-Export-Warnings', encodeURIComponent(JSON.stringify(file.warnings)))
+      res.setHeader('Access-Control-Expose-Headers', 'Content-Disposition, X-Export-Warnings')
+      res.send(file.data)
     } catch (err) {
       sendError(res, err)
     }

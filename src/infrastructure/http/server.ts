@@ -7,6 +7,8 @@ import { createChatRouter } from './routes/chat.routes'
 import { createWahooRouter } from './routes/wahoo.routes'
 import { createPlanRouter } from './routes/plan.routes'
 import { createEventsRouter } from './routes/events.routes'
+import { createCheckInsRouter } from './routes/checkins.routes'
+import { createTestsRouter } from './routes/tests.routes'
 
 const PORT = process.env.PORT ?? 3000
 
@@ -38,6 +40,8 @@ async function bootstrap(): Promise<void> {
   app.use('/api/wahoo',   createWahooRouter(container))
   app.use('/api/plan',    createPlanRouter(container))
   app.use('/api/events',  createEventsRouter(container))
+  app.use('/api/checkins', createCheckInsRouter(container))
+  app.use('/api/tests',   createTestsRouter(container))
 
   app.get('/health', (_req: Request, res: Response) => {
     res.json({ status: 'ok', timestamp: new Date().toISOString() })

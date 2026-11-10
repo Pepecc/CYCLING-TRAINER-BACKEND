@@ -44,6 +44,19 @@ import { TrainingPeaksParser } from '../infrastructure/import/TrainingPeaksParse
 import { NativePlanParser } from '../infrastructure/import/NativePlanParser'
 import { AIPlanImageExtractor } from '../infrastructure/ai/AIPlanImageExtractor'
 import { ConversationRepository } from '../domain/chat/ConversationRepository'
+import { FirestoreCheckInRepository } from '../infrastructure/persistence/firestore/FirestoreCheckInRepository'
+import { FirestoreFitnessTestRepository } from '../infrastructure/persistence/firestore/FirestoreFitnessTestRepository'
+import { SaveDailyCheckIn } from '../application/wellness/SaveDailyCheckIn'
+import { GetDailyCheckIns } from '../application/wellness/GetDailyCheckIns'
+import { DeleteDailyCheckIn } from '../application/wellness/DeleteDailyCheckIn'
+import { GetFitnessTests } from '../application/testing/GetFitnessTests'
+import { ScheduleFitnessTest } from '../application/testing/ScheduleFitnessTest'
+import { RecordFitnessTest } from '../application/testing/RecordFitnessTest'
+import { GetWeeklySummary } from '../application/planning/GetWeeklySummary'
+import { ExportPlannedWorkout } from '../application/planning/ExportPlannedWorkout'
+import { FitWorkoutEncoder } from '../infrastructure/export/FitWorkoutEncoder'
+import { ZwoWorkoutEncoder } from '../infrastructure/export/ZwoWorkoutEncoder'
+import { ProgressTools } from '../infrastructure/ai/tools/ProgressTools'
 
 export interface Container {
   updateProfile:       UpdateProfile
@@ -74,6 +87,14 @@ export interface Container {
   importPlannedWorkouts: ImportPlannedWorkouts
   extractPlanFromImage: ExtractPlanFromImage
   conversationRepository: ConversationRepository
+  saveDailyCheckIn:    SaveDailyCheckIn
+  getDailyCheckIns:    GetDailyCheckIns
+  deleteDailyCheckIn:  DeleteDailyCheckIn
+  getFitnessTests:     GetFitnessTests
+  scheduleFitnessTest: ScheduleFitnessTest
+  recordFitnessTest:   RecordFitnessTest
+  getWeeklySummary:    GetWeeklySummary
+  exportPlannedWorkout: ExportPlannedWorkout
 }
 
 export function buildContainer(): Container {
@@ -89,6 +110,8 @@ export function buildContainer(): Container {
   const workoutRepository      = new FirestoreWorkoutRepository(db)
   const plannedWorkoutRepository = new FirestorePlannedWorkoutRepository(db)
   const raceEventRepository    = new FirestoreRaceEventRepository(db)
+  const checkInRepository      = new FirestoreCheckInRepository(db)
+  const fitnessTestRepository  = new FirestoreFitnessTestRepository(db)
 
   // --- Configure Firebase auth middleware ---
   configureAuth(userRepository)
@@ -118,8 +141,15 @@ export function buildContainer(): Container {
     reconcilePlan, replanWeek, getFormProjection
   )
   const seasonTools   = new SeasonTools(saveRaceEvents, updateRaceEvent, deleteRaceEvent, getRaceEvents, getSeasonPlan)
-  const toolExecutor  = new ToolExecutor(syncWorkouts, workoutRepository, profileRepository, updateProfile, planningTools, seasonTools)
-  const sendMessage   = new SendMessage(conversationRepository, profileRepository, aiPort, toolExecutor, getSeasonPlan, reconcilePlan)
+  const getDailyCheckIns    = new GetDailyCheckIns(checkInRepository, profileRepository)
+  const saveDailyCheckIn    = new SaveDailyCheckIn(checkInRepository, getDailyCheckIns)
+  const getFitnessTests     = new GetFitnessTests(fitnessTestRepository, plannedWorkoutRepository, profileRepository, getSeasonPlan)
+  const scheduleFitnessTest = new ScheduleFitnessTest(plannedWorkoutRepository, profileRepository)
+  const recordFitnessTest   = new RecordFitnessTest(fitnessTestRepository, plannedWorkoutRepository, profileRepository, checkInRepository, updateProfile)
+  const getWeeklySummary    = new GetWeeklySummary(reconcilePlan, getTrainingPlan, workoutRepository, profileRepository, getDailyCheckIns, getSeasonPlan)
+  const progressTools = new ProgressTools(saveDailyCheckIn, getDailyCheckIns, getFitnessTests, scheduleFitnessTest, recordFitnessTest, getWeeklySummary)
+  const toolExecutor  = new ToolExecutor(syncWorkouts, workoutRepository, profileRepository, updateProfile, planningTools, seasonTools, progressTools)
+  const sendMessage   = new SendMessage(conversationRepository, profileRepository, aiPort, toolExecutor, getSeasonPlan, reconcilePlan, getDailyCheckIns)
   const previewPlanImport = new PreviewPlanImport(
     [new TrainingPeaksParser(), new NativePlanParser()], plannedWorkoutRepository, profileRepository
   )
@@ -155,5 +185,13 @@ export function buildContainer(): Container {
     importPlannedWorkouts,
     extractPlanFromImage,
     conversationRepository,
+    saveDailyCheckIn,
+    getDailyCheckIns,
+    deleteDailyCheckIn: new DeleteDailyCheckIn(checkInRepository),
+    getFitnessTests,
+    scheduleFitnessTest,
+    recordFitnessTest,
+    getWeeklySummary,
+    exportPlannedWorkout: new ExportPlannedWorkout(plannedWorkoutRepository, profileRepository, [new FitWorkoutEncoder(), new ZwoWorkoutEncoder()]),
   }
 }

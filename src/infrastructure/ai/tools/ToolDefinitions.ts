@@ -3,6 +3,9 @@ import {
   STEP_KINDS, TARGET_TYPES, WORKOUT_FOCUSES, ENVIRONMENTS, PLANNED_STATUSES,
 } from '../../../domain/planning/PlannedWorkout'
 import { RACE_PRIORITIES, RACE_TYPES } from '../../../domain/events/RaceEvent'
+import { TEST_PROTOCOLS } from '../../../domain/testing/fitnessTest'
+
+const scale = (what: string) => ({ type: 'number' as const, description: `${what} (1-5)` })
 
 // ─── Esquema de un entreno planificado (compartido por save y update) ────────
 
@@ -392,6 +395,114 @@ export const toolDefinitions: AgentTool[] = [
       parameters: {
         type: 'object',
         properties: {},
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'save_daily_checkin',
+      description: `Guarda el check-in diario del ciclista: cansancio, sueño, sensaciones, dolor muscular y FC al despertar.
+        Úsalo en cuanto el ciclista te cuente cómo ha dormido o cómo se encuentra (p.ej. "he dormido 5 horas y voy reventado").
+        Traduce lo que diga a las escalas de 1 a 5 sin exagerar; envía solo lo que haya dicho. Un check-in por día:
+        volver a llamarlo ese día añade o corrige datos. Devuelve la disponibilidad para entrenar (buena, normal,
+        precaución, descanso recomendado) con sus motivos.`,
+      parameters: {
+        type: 'object',
+        properties: {
+          date: { type: 'string', description: 'Día AAAA-MM-DD. Default: hoy' },
+          fatigue: scale('Cansancio: 1 fresco, 3 normal, 5 agotado'),
+          sleep_hours: { type: 'number', description: 'Horas dormidas (admite decimales)' },
+          sleep_quality: scale('Calidad del sueño: 1 muy mala, 5 muy buena'),
+          feeling: scale('Sensaciones y ánimo: 1 muy malas, 5 muy buenas'),
+          soreness: scale('Dolor muscular: 1 nada, 5 mucho'),
+          morning_hr: { type: 'number', description: 'FC al despertar, en reposo (ppm)' },
+          notes: { type: 'string', description: 'Notas breves (enfermedad, estrés, viaje...)' },
+        },
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'get_checkins',
+      description: `Obtiene los check-ins diarios de los últimos días (cansancio, sueño, sensaciones, dolor, FC al despertar),
+        con la disponibilidad de cada día y las medias. Úsalo antes de planificar o adaptar la semana, cuando hable de fatiga
+        o de cómo se encuentra, y al valorar si conviene descargar.`,
+      parameters: {
+        type: 'object',
+        properties: {
+          days: { type: 'number', description: 'Días hacia atrás desde hoy. Default: 7' },
+        },
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'get_fitness_tests',
+      description: `Obtiene el historial de tests (FTP, FC máxima, FC en reposo), los tests ya programados, si toca hacer
+        un test de FTP (cada 6-8 semanas) o de FC, con una fecha sugerida (final de la próxima semana de descarga),
+        y la descripción de cada protocolo. Úsalo antes de programar un test y cuando hable de su FTP o de sus zonas.`,
+      parameters: { type: 'object', properties: {} },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'schedule_fitness_test',
+      description: `Programa un test en el plan como sesión estructurada (calentamiento, activaciones, test y vuelta a la calma).
+        Protocolos: ftp_20min (FTP = 95 % de 20 min), ftp_8min (90 % de la media de 2 × 8 min), ramp (75 % del mejor minuto;
+        necesita rodillo con potencia) y max_hr (FC máxima). Los de FTP necesitan potenciómetro: en la bici estática solo con
+        pulsómetro, usa max_hr. Ponlo descansado (al final de una semana de descarga) y como única sesión del día.
+        Pide antes la conformidad del ciclista con el día.`,
+      parameters: {
+        type: 'object',
+        properties: {
+          protocol: { type: 'string', enum: TEST_PROTOCOLS.filter(p => p !== 'resting_hr'), description: 'Protocolo del test' },
+          date: { type: 'string', description: 'Fecha AAAA-MM-DD' },
+          environment: { type: 'string', enum: ENVIRONMENTS, description: 'Dónde lo hará. Default: outdoor para FTP de 20 y 8 min, indoor para rampa y FC' },
+        },
+        required: ['protocol', 'date'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'record_fitness_test',
+      description: `Registra el resultado de un test y actualiza el perfil: el FTP (y con él las zonas de potencia y el TSS
+        previsto) o la FC máxima / en reposo (zonas de FC y hrTSS). Calcula el valor según el protocolo: no lo calcules tú.
+        Sin save devuelve una vista previa con el valor nuevo frente al anterior y las zonas; con save: true lo guarda
+        y marca como hecho el test del plan de ese día.
+        resting_hr sin value usa la media de la FC al despertar de los check-ins de la última semana.`,
+      parameters: {
+        type: 'object',
+        properties: {
+          protocol: { type: 'string', enum: TEST_PROTOCOLS, description: 'Protocolo (si va enlazado a un test del plan, se toma de él)' },
+          value: { type: 'number', description: 'Dato medido: potencia media del esfuerzo del test (W) o FC (ppm), según el protocolo' },
+          date: { type: 'string', description: 'Día del test AAAA-MM-DD. Default: hoy (o el del test del plan)' },
+          planned_workout_id: { type: 'string', description: 'id del test en el plan (opcional; si no, se busca el de ese día)' },
+          notes: { type: 'string', description: 'Condiciones del test (calor, cansancio, recorrido...)' },
+          save: { type: 'boolean', description: 'true = guardar y actualizar el perfil. Default: false (vista previa)' },
+        },
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'get_weekly_summary',
+      description: `Resumen de una semana (lunes a domingo): planificado frente a hecho (sesiones, horas, TSS y cumplimiento),
+        sesiones clave y su estado, lo hecho fuera del plan, las medias de los check-ins, cómo cambian CTL/ATL/TSB,
+        el tipo de semana del plan de temporada y una recomendación para la semana siguiente (subir, mantener, bajar o
+        descargar) con un TSS orientativo frente al ya planificado. Primero enlaza la semana con Wahoo.
+        Úsalo cuando pregunte qué tal la semana, al cerrar una semana o antes de planificar la siguiente.`,
+      parameters: {
+        type: 'object',
+        properties: {
+          week: { type: 'string', description: 'Cualquier día de la semana, AAAA-MM-DD. Default: la semana actual (el lunes, usa la anterior)' },
+        },
       },
     },
   },
